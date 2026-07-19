@@ -182,6 +182,21 @@ void releaseAll() {
 
 void updateTray();
 
+// Controller polling can run at 200 Hz, but the UI must not repaint at that rate.
+// Repainting the whole parent window beneath native child controls causes visible
+// flashing on some Windows compositor / GPU combinations.
+ULONGLONG g_lastVisualRefresh{};
+void refreshVisualization(bool force = false) {
+    if (!g_window) return;
+    const ULONGLONG now = GetTickCount64();
+    if (!force && now - g_lastVisualRefresh < 33) return; // Cap visual updates at ~30 FPS.
+    g_lastVisualRefresh = now;
+    const RECT header{0, 0, 720, 90};
+    const RECT canvas{0, 140, 720, 425};
+    InvalidateRect(g_window, &header, FALSE);
+    InvalidateRect(g_window, &canvas, FALSE);
+}
+
 void setActive(bool active) {
     const bool ready = g_joystick && (g_gamepad || g_map.valid()) && g_wizardStage < 0;
     if (active && !ready) return;
@@ -194,7 +209,7 @@ void setActive(bool active) {
     if (g_window) SetTimer(g_window, TIMER_INPUT, active ? 5 : 16, nullptr);
     SetWindowTextW(g_button, active ? L"Deactivate" : L"Activate");
     updateTray();
-    InvalidateRect(g_window, nullptr, FALSE);
+    refreshVisualization(true);
 }
 
 void closeSelected() {
@@ -254,7 +269,7 @@ void openSelected(SDL_JoystickID id) {
     }
     QueryPerformanceCounter(&g_lastQpc);
     updateTray();
-    InvalidateRect(g_window, nullptr, FALSE);
+    refreshVisualization(true);
 }
 
 void selectDeviceIndex(int index) {
@@ -281,11 +296,15 @@ void scanDevices(bool force = false) {
     if (same) for (size_t i = 0; i < next.size(); ++i) if (next[i].id != g_devices[i].id || next[i].name != g_devices[i].name) { same = false; break; }
     bool currentPresent = false;
     for (auto& d : next) if (d.id == g_selectedId) currentPresent = true;
-    if (g_selectedId && !currentPresent) closeSelected();
+    const bool disconnected = g_selectedId && !currentPresent;
+    if (disconnected) closeSelected();
     g_devices = std::move(next);
     if (!same) {
+        SendMessageW(g_combo, WM_SETREDRAW, FALSE, 0);
         SendMessageW(g_combo, CB_RESETCONTENT, 0, 0);
         for (auto& d : g_devices) SendMessageW(g_combo, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(d.name.c_str()));
+        SendMessageW(g_combo, WM_SETREDRAW, TRUE, 0);
+        InvalidateRect(g_combo, nullptr, TRUE);
     }
     int chosen = -1;
     if (g_selectedId) for (size_t i = 0; i < g_devices.size(); ++i) if (g_devices[i].id == g_selectedId) chosen = static_cast<int>(i);
@@ -299,7 +318,10 @@ void scanDevices(bool force = false) {
     } else SendMessageW(g_combo, CB_SETCURSEL, -1, 0);
     EnableWindow(g_combo, !g_devices.empty());
     EnableWindow(g_button, g_joystick && (g_gamepad || g_map.valid()) && g_wizardStage < 0);
-    updateTray(); InvalidateRect(g_window, nullptr, FALSE);
+    if (!same || disconnected) {
+        updateTray();
+        refreshVisualization(true);
+    }
 }
 
 double axisNorm(Sint16 v) { return std::clamp(v < 0 ? v / 32768.0 : v / 32767.0, -1.0, 1.0); }
@@ -356,7 +378,7 @@ void wizardTick() {
         g_wizardAwaitNeutral = false;
     }
     for (int i = 0; i < axes; ++i) g_axisPeak[i] = std::max(g_axisPeak[i], std::abs(static_cast<int>(SDL_GetJoystickAxis(g_joystick, i)) - g_axisBase[i]));
-    auto reset = [&] { std::fill(g_axisPeak.begin(), g_axisPeak.end(), 0); g_wizardAwaitNeutral = true; g_wizardCooldown = GetTickCount64() + 450; InvalidateRect(g_window, nullptr, FALSE); };
+    auto reset = [&] { std::fill(g_axisPeak.begin(), g_axisPeak.end(), 0); g_wizardAwaitNeutral = true; g_wizardCooldown = GetTickCount64() + 450; refreshVisualization(true); };
     if (g_wizardStage <= 1) {
         std::vector<int> order(axes); for (int i = 0; i < axes; ++i) order[i] = i;
         std::sort(order.begin(), order.end(), [&](int a, int b) { return g_axisPeak[a] > g_axisPeak[b]; });
@@ -407,7 +429,7 @@ void processInput() {
     LARGE_INTEGER now{}; QueryPerformanceCounter(&now);
     double dt = (now.QuadPart - g_lastQpc.QuadPart) / static_cast<double>(g_qpcFreq.QuadPart);
     g_lastQpc = now; dt = std::clamp(dt, 0.001, 0.032);
-    if (!g_active) { releaseAll(); InvalidateRect(g_window, nullptr, FALSE); return; }
+    if (!g_active) { releaseAll(); refreshVisualization(); return; }
     if (!g_joystick || (!g_gamepad && !g_map.valid())) { setActive(false); return; }
     auto move = cm::radialDeadZone(g_live.lx, g_live.ly, g_deadZonePercent / 100.0);
     double mag = std::min(1.0, std::sqrt(move.x * move.x + move.y * move.y));
@@ -429,7 +451,7 @@ void processInput() {
     if (g_copy.update(g_live.copy) == 1) sendShortcut('C');
     if (g_paste.update(g_live.paste) == 1) sendShortcut('V');
     if (g_inputError) { g_inputError = false; setActive(false); }
-    InvalidateRect(g_window, nullptr, FALSE);
+    refreshVisualization();
 }
 
 void loadSupplementalMappings() {
@@ -518,7 +540,9 @@ void paint(HWND hwnd) {
         RECT box{30, 475, 690, 519}; HBRUSH b=CreateSolidBrush(RGB(53,42,26)); FillRect(dc,&box,b); DeleteObject(b);
         drawText(dc,48,486,prompts[std::clamp(g_wizardStage,0,7)],RGB(255,196,96),14,FW_BOLD);
     }
-    BitBlt(target, 0, 0, client.right, client.bottom, dc, 0, 0, SRCCOPY);
+    BitBlt(target, ps.rcPaint.left, ps.rcPaint.top,
+           ps.rcPaint.right - ps.rcPaint.left, ps.rcPaint.bottom - ps.rcPaint.top,
+           dc, ps.rcPaint.left, ps.rcPaint.top, SRCCOPY);
     SelectObject(dc, oldBitmap); DeleteObject(bitmap); DeleteDC(dc);
     EndPaint(hwnd, &ps);
 }
@@ -548,7 +572,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         else if (source == g_scrollSlider) g_scrollSensitivity = static_cast<int>(SendMessageW(source, TBM_GETPOS, 0, 0));
         else if (source == g_deadZoneSlider) g_deadZonePercent = static_cast<int>(SendMessageW(source, TBM_GETPOS, 0, 0));
         else break;
-        saveSensitivity(); InvalidateRect(hwnd, nullptr, FALSE); return 0;
+        saveSensitivity(); refreshVisualization(true); return 0;
     }
     case WM_COMMAND:
         if (LOWORD(wp)==ID_ACTIVATE && HIWORD(wp)==BN_CLICKED) setActive(!g_active);
