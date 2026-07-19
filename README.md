@@ -2,6 +2,16 @@
 
 Pad Pilot is a lightweight, native Windows controller-to-mouse utility built with C++20, Win32, SDL3, and `SendInput`. It starts inactive, works from the notification area, supports mapped SDL gamepads plus a generic joystick fallback, and never requires controller-hiding drivers.
 
+## Download
+
+**Do not use GitHub's `Source code (zip)` download.** That is source code, not the Windows app.
+
+Download the portable Windows build here:
+
+[PadPilot_v1_0_Portable.zip](https://github.com/Neo664evr/PadPilot/raw/main/releases/PadPilot_v1_0_Portable.zip)
+
+Extract it, then run `PadPilot_v1_0.exe`. Keep `SDL3.dll` beside the EXE.
+
 ## Default controls
 
 | Controller input | Action |
@@ -15,7 +25,7 @@ Pad Pilot is a lightweight, native Windows controller-to-mouse utility built wit
 | X / Square | Copy (`Ctrl+C`) |
 | A / Cross | Paste (`Ctrl+V`) |
 
-Cursor speed, scroll speed, and dead-zone settings are available in the main window and saved under `%LOCALAPPDATA%\PadPilot\`.
+Cursor speed, scroll speed, and dead-zone settings are available in the main window and saved under `%LOCALAPPDATA%\\PadPilot\\`.
 
 ## Build
 
