@@ -6,11 +6,11 @@ Pad Pilot is a lightweight, native Windows controller-to-mouse utility built wit
 
 **Do not use GitHub's `Source code (zip)` download.** That is source code, not the Windows app.
 
-Download the portable Windows build here:
+1. Download [Download-PadPilot.cmd](https://raw.githubusercontent.com/Neo664evr/PadPilot/main/Download-PadPilot.cmd).
+2. Double-click it. It downloads, verifies/rebuilds, and extracts the real portable build.
+3. Open `PadPilot_v1_0_Portable` and run `PadPilot_v1_0.exe`.
 
-[PadPilot_v1_0_Portable.zip](https://github.com/Neo664evr/PadPilot/raw/main/releases/PadPilot_v1_0_Portable.zip)
-
-Extract it, then run `PadPilot_v1_0.exe`. Keep `SDL3.dll` beside the EXE.
+The resulting folder contains the EXE, `SDL3.dll`, and required license notices. Keep `SDL3.dll` beside the EXE.
 
 ## Default controls
 
