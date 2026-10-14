@@ -1,8 +1,8 @@
-name: LocalLens v3 Stability IPA
+name: LocalLens v3.1 Memory Diagnostics IPA
 on:
   push:
     branches:
-      - locallens-v3-stability-20261013
+      - locallens-v3-memory-metrics-20261014
     paths:
       - "LocalLens/**"
       - ".github/workflows/locallens-ipa.yml"
@@ -52,6 +52,9 @@ jobs:
           grep -q 'Coming Soon' LocalLens/Sources/LocalLensApp.swift
           grep -q 'conversationKey' LocalLens/Sources/LocalLensApp.swift
           grep -q 'settingsSheet' LocalLens/Sources/LocalLensApp.swift
+          grep -q 'phys_footprint' LocalLens/Sources/LocalLensApp.swift
+          grep -q 'physicalMemory' LocalLens/Sources/LocalLensApp.swift
+          grep -q 'More memory iOS permits this app' LocalLens/Sources/LocalLensApp.swift
           echo 'Stability source checks passed'
       - name: Package unsigned IPA and verify app
         shell: bash
@@ -67,11 +70,11 @@ jobs:
           /usr/libexec/PlistBuddy -c "Print :CFBundleExecutable" "$APP/Info.plist"
           mkdir -p dist/Payload
           cp -R "$APP" dist/Payload/
-          (cd dist && zip -q -r ../LocalLens-v3-Stability.ipa Payload)
-          unzip -t LocalLens-v3-Stability.ipa | tail -n 1
-          ls -lh LocalLens-v3-Stability.ipa
+          (cd dist && zip -q -r ../LocalLens-v3.1-Memory.ipa Payload)
+          unzip -t LocalLens-v3.1-Memory.ipa | tail -n 1
+          ls -lh LocalLens-v3.1-Memory.ipa
       - uses: actions/upload-artifact@v4
         with:
-          name: LocalLens-v3-Stability-IPA
-          path: LocalLens-v3-Stability.ipa
+          name: LocalLens-v3.1-Memory-IPA
+          path: LocalLens-v3.1-Memory.ipa
           if-no-files-found: error
