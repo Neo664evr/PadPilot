@@ -1,9 +1,12 @@
 import SwiftUI
 import PhotosUI
 import UniformTypeIdentifiers
+import ImageIO
+import AVFoundation
+import Darwin
 
 // LocalLens: a standalone on-device GGUF chat and vision client.
-struct LocalChat: Identifiable {
+struct LocalChat: Identifiable, Codable {
     let id: UUID
     let role: String
     var text: String
@@ -15,6 +18,15 @@ struct LocalChat: Identifiable {
     }
 }
 
+struct RunSettings {
+    let maxTokens: Int
+    let temperature: Float
+    let topP: Float
+    let topK: Int
+    let reasoningBudget: Int
+    let stopWords: [String]
+}
+
 final class LocalRuntime: ObservableObject {
     @Published var messages: [LocalChat] = []
     @Published var status = "Select a language model to begin."
@@ -22,57 +34,132 @@ final class LocalRuntime: ObservableObject {
     @Published var generating = false
     @Published var ready = false
     @Published var vision = false
+    @Published var lastStats = ""
+    @Published var memoryStatus = ""
 
     private let bridge = LlamaBridge()
     private let queue = DispatchQueue(label: "locallens.inference", qos: .userInitiated)
     private var firstTurn = true
     private var gemmaDialect = false
+    private(set) var loadedModelPath: String?
+    private(set) var loadedProjectorPath: String?
+    private static let conversationKey = "locallens.v3.messages"
 
-    func load(modelPath: String, projectorPath: String?) {
+    init() {
+        if let data = UserDefaults.standard.data(forKey: Self.conversationKey),
+           let previous = try? JSONDecoder().decode([LocalChat].self, from: data) {
+            messages = Array(previous.suffix(150))
+            if !messages.isEmpty {
+                status = "Chat restored. Load a model to resume."
+            }
+        }
+        refreshMemoryStatus()
+    }
+
+    func refreshMemoryStatus() {
+        #if targetEnvironment(simulator)
+        memoryStatus = "Simulator memory"
+        #else
+        let available = Int64(os_proc_available_memory())
+        memoryStatus = available > 0
+            ? "Available memory: \(ByteCountFormatter.string(fromByteCount: available, countStyle: .memory))"
+            : "Available memory: unknown"
+        #endif
+    }
+
+    private func persist() {
+        if let data = try? JSONEncoder().encode(Array(messages.suffix(150))) {
+            UserDefaults.standard.set(data, forKey: Self.conversationKey)
+        }
+    }
+
+    func load(modelPath: String, projectorPath: String?, context: Int = 4096,
+              gpuLayers: Int = 999, systemPrompt: String = "") {
         guard !loading && !generating else { return }
+        guard FileManager.default.fileExists(atPath: modelPath) else {
+            status = "Model file missing. Import it again."
+            return
+        }
+        if let projectorPath, !FileManager.default.fileExists(atPath: projectorPath) {
+            status = "Vision projector file missing."
+            return
+        }
+        #if !targetEnvironment(simulator)
+        if projectorPath != nil && os_proc_available_memory() < 1_700 * 1024 * 1024 {
+            status = "Not enough free memory to load vision safely. Close other apps or choose smaller weights."
+            return
+        }
+        #endif
         ready = false
         loading = true
         status = "Loading model…"
+        let gpu = max(0, min(999, gpuLayers))
+        let ctx = max(1024, min(16384, context))
         queue.async {
             self.bridge.unload()
             do {
-                // The bridge ships with llama.cpp + mtmd / Metal.
                 try self.bridge.loadModel(atPath: modelPath,
                                           mmprojPath: projectorPath,
-                                          nCtx: 4096,
-                                          nGpuLayers: 999,
+                                          nCtx: Int32(ctx),
+                                          nGpuLayers: Int32(gpu),
                                           compressionEnabled: true)
-                try self.bridge.reset(withSystemPrompt: "")
-                let snapshot = self.bridge.modelInfo
-                let hasVision = snapshot?.supportsVision ?? false
-                let gemma = snapshot?.chatTemplate.contains("<start_of_turn>") ?? modelPath.lowercased().contains("gemma")
+                // Gemma has no system role. Embed it with the first user turn.
+                let info = self.bridge.modelInfo
+                let gemma = info?.chatTemplate.contains("<start_of_turn>") ?? modelPath.lowercased().contains("gemma")
+                let prompt = !gemma && !systemPrompt.isEmpty
+                    ? "<|im_start|>system\n\(systemPrompt)<|im_end|>\n"
+                    : ""
+                try self.bridge.reset(withSystemPrompt: prompt)
+                let hasVision = info?.supportsVision ?? false
                 DispatchQueue.main.async {
-                    self.ready = true
                     self.loading = false
+                    self.ready = true
                     self.vision = hasVision
                     self.gemmaDialect = gemma
+                    self.loadedModelPath = modelPath
+                    self.loadedProjectorPath = projectorPath
                     self.firstTurn = true
-                    self.messages = []
+                    self.lastStats = ""
                     self.status = hasVision ? "Ready · Vision enabled" : "Ready · Text chat"
+                    self.refreshMemoryStatus()
                 }
             } catch {
+                self.bridge.unload()
                 DispatchQueue.main.async {
                     self.loading = false
+                    self.ready = false
+                    self.vision = false
+                    self.loadedModelPath = nil
+                    self.loadedProjectorPath = nil
                     self.status = "Load failed: \(error.localizedDescription)"
+                    self.refreshMemoryStatus()
                 }
             }
         }
     }
 
+    func unload() {
+        guard !loading && !generating else { return }
+        ready = false
+        vision = false
+        loadedModelPath = nil
+        loadedProjectorPath = nil
+        status = "Model offloaded."
+        queue.async {
+            self.bridge.unload()
+            DispatchQueue.main.async { self.refreshMemoryStatus() }
+        }
+    }
+
     func reset() {
-        guard ready && !loading && !generating else { return }
+        guard !loading && !generating else { return }
+        messages = []
+        persist()
+        firstTurn = true
+        guard ready else { return }
         queue.async {
             do {
                 try self.bridge.reset(withSystemPrompt: "")
-                DispatchQueue.main.async {
-                    self.messages = []
-                    self.firstTurn = true
-                }
             } catch {
                 DispatchQueue.main.async { self.status = error.localizedDescription }
             }
@@ -81,27 +168,45 @@ final class LocalRuntime: ObservableObject {
 
     func stop() { bridge.requestStop() }
 
-    func send(text: String, imagePath: String?) {
+    @discardableResult
+    func send(text: String, imagePath: String?, options: RunSettings,
+              systemPrompt: String = "", minimumImageMemoryMB: Int = 1400) -> Bool {
         let question = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard ready && !generating && (!question.isEmpty || imagePath != nil) else { return }
-        if imagePath != nil && !vision {
-            status = "Load a matching mmproj projector before sending images."
-            return
+        guard ready && !generating && (!question.isEmpty || imagePath != nil) else { return false }
+        if let imagePath {
+            guard vision else {
+                status = "Load your matching vision projector before sending images."
+                return false
+            }
+            guard FileManager.default.fileExists(atPath: imagePath) else {
+                status = "Image attachment missing. Select it again."
+                return false
+            }
+            #if !targetEnvironment(simulator)
+            let available = os_proc_available_memory()
+            if available < UInt64(max(700, minimumImageMemoryMB)) * 1024 * 1024 {
+                status = "Image held back to prevent iOS memory termination. Offload and try a smaller GGUF, or close other apps."
+                refreshMemoryStatus()
+                return false
+            }
+            #endif
         }
+
         let answerID = UUID()
         messages.append(LocalChat(role: "user", text: (imagePath == nil ? "" : "📷 ") + question))
         messages.append(LocalChat(id: answerID, role: "assistant", text: ""))
+        persist()
         generating = true
-        status = "Generating…"
-
+        status = imagePath == nil ? "Generating…" : "Analyzing image…"
         let isFirst = firstTurn
         firstTurn = false
-        let gemma = gemmaDialect
         let mediaMarker = imagePath == nil ? "" : LlamaBridge.mediaMarker() + "\n"
+        let gemma = gemmaDialect
         let prompt: String
         if gemma {
             let prefix = isFirst ? "" : "<end_of_turn>\n"
-            prompt = prefix + "<start_of_turn>user\n" + mediaMarker + question +
+            let sys = isFirst && !systemPrompt.isEmpty ? systemPrompt + "\n\n" : ""
+            prompt = prefix + "<start_of_turn>user\n" + sys + mediaMarker + question +
                      "<end_of_turn>\n<start_of_turn>model\n"
         } else {
             let prefix = isFirst ? "" : "<|im_end|>\n"
@@ -110,27 +215,70 @@ final class LocalRuntime: ObservableObject {
         }
         let imagePaths: [String] = imagePath.map { [$0] } ?? []
         queue.async {
+            // Refuse risky image decoding while memory is constrained.
+            #if !targetEnvironment(simulator)
+            if !imagePaths.isEmpty && os_proc_available_memory() < UInt64(max(700, minimumImageMemoryMB)) * 1024 * 1024 {
+                DispatchQueue.main.async {
+                    self.generating = false
+                    self.status = "Image not processed: insufficient free memory."
+                    if let i = self.messages.firstIndex(where: { $0.id == answerID }) {
+                        self.messages[i].text = "Image processing stopped before encoding to protect the app from a memory crash."
+                    }
+                    self.persist()
+                }
+                return
+            }
+            #endif
             let params = LMGenerationParams.defaults()
-            params.maxTokens = 768
-            params.temperature = 0.7
+            params.maxTokens = Int32(max(32, min(4096, options.maxTokens)))
+            params.temperature = max(0, min(2, options.temperature))
+            params.topP = max(0.1, min(1, options.topP))
+            params.topK = Int32(max(0, min(200, options.topK)))
+            params.thinkBudget = Int32(max(0, options.reasoningBudget))
+            var stopReached = false
+            let started = Date()
             self.bridge.generate(withPrompt: prompt,
                                  imagePaths: imagePaths,
                                  audioPaths: [],
                                  params: params,
                                  onToken: { piece in
+                guard !stopReached else { return }
                 DispatchQueue.main.async {
-                    if let index = self.messages.firstIndex(where: { $0.id == answerID }) {
-                        self.messages[index].text += piece
+                    guard let index = self.messages.firstIndex(where: { $0.id == answerID }) else { return }
+                    var candidate = self.messages[index].text + piece
+                    if let stop = options.stopWords.filter({ !$0.isEmpty })
+                        .compactMap({ marker -> (Int, String)? in
+                            if let range = candidate.range(of: marker) {
+                                return (candidate.distance(from: candidate.startIndex, to: range.lowerBound), marker)
+                            }
+                            return nil
+                        }).min(by: { $0.0 < $1.0 }) {
+                        candidate = String(candidate.prefix(stop.0))
+                        stopReached = true
+                        self.bridge.requestStop()
                     }
+                    self.messages[index].text = candidate
                 }
             }, onDone: { success, message, stats in
+                let elapsed = Date().timeIntervalSince(started)
                 DispatchQueue.main.async {
                     self.generating = false
-                    self.status = success ? (self.vision ? "Ready · Vision enabled" : "Ready · Text chat") :
-                        "Generation failed: \(message ?? "Unknown error")"
+                    self.lastStats = (stats ?? "") + String(format: " · %.1fs", elapsed)
+                    if !success {
+                        self.status = "Generation failed: \(message ?? "Unknown error")"
+                        if let i = self.messages.firstIndex(where: { $0.id == answerID }),
+                           self.messages[i].text.isEmpty {
+                            self.messages[i].text = "⚠️ \(message ?? "Model generation failed.")"
+                        }
+                    } else {
+                        self.status = self.vision ? "Ready · Vision enabled" : "Ready · Text chat"
+                    }
+                    self.refreshMemoryStatus()
+                    self.persist()
                 }
             })
         }
+        return true
     }
 }
 
