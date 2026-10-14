@@ -1,8 +1,8 @@
-name: LocalLens v2 IPA
+name: LocalLens v3 Stability IPA
 on:
   push:
     branches:
-      - locallens-v2-20261013
+      - locallens-v3-stability-20261013
     paths:
       - "LocalLens/**"
       - ".github/workflows/locallens-ipa.yml"
@@ -43,6 +43,16 @@ jobs:
       - name: Build unsigned device app
         run: |
           xcodebuild -project LocalLens/LocalLens.xcodeproj -scheme LocalLens -configuration Release -sdk iphoneos -destination 'generic/platform=iOS' -derivedDataPath "$PWD/DerivedData" build CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY=""
+      - name: Verify stability features are present
+        run: |
+          set -euo pipefail
+          grep -q 'CGImageSourceCreateThumbnailAtIndex' LocalLens/Sources/LocalLensApp.swift
+          grep -q 'minimumImageMemoryMB' LocalLens/Sources/LocalLensApp.swift
+          grep -q 'deleteFile(_ file: URL)' LocalLens/Sources/LocalLensApp.swift
+          grep -q 'Coming Soon' LocalLens/Sources/LocalLensApp.swift
+          grep -q 'conversationKey' LocalLens/Sources/LocalLensApp.swift
+          grep -q 'settingsSheet' LocalLens/Sources/LocalLensApp.swift
+          echo 'Stability source checks passed'
       - name: Package unsigned IPA and verify app
         shell: bash
         run: |
@@ -57,11 +67,11 @@ jobs:
           /usr/libexec/PlistBuddy -c "Print :CFBundleExecutable" "$APP/Info.plist"
           mkdir -p dist/Payload
           cp -R "$APP" dist/Payload/
-          (cd dist && zip -q -r ../LocalLens-v2.ipa Payload)
-          unzip -t LocalLens-v2.ipa | tail -n 1
-          ls -lh LocalLens-v2.ipa
+          (cd dist && zip -q -r ../LocalLens-v3-Stability.ipa Payload)
+          unzip -t LocalLens-v3-Stability.ipa | tail -n 1
+          ls -lh LocalLens-v3-Stability.ipa
       - uses: actions/upload-artifact@v4
         with:
-          name: LocalLens-v2-IPA
-          path: LocalLens-v2.ipa
+          name: LocalLens-v3-Stability-IPA
+          path: LocalLens-v3-Stability.ipa
           if-no-files-found: error
