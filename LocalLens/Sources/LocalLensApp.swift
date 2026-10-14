@@ -6,7 +6,7 @@ import AVFoundation
 import Darwin
 
 // LocalLens: a standalone on-device GGUF chat and vision client.
-struct LocalChat: Identifiable, Codable {
+struct LocalChat: Identifiable, Codable, Equatable {
     let id: UUID
     let role: String
     var text: String
@@ -29,6 +29,23 @@ struct RunSettings {
 
 final class LocalRuntime: ObservableObject {
     @Published var messages: [LocalChat] = []
+    @Published private(set) var conversations: [LocalConversation] = []
+    @Published private(set) var activeConversationID: UUID?
+    @Published var conversationNotice = ""
+
+    var activeConversation: LocalConversation? {
+        conversations.first(where: { $0.id == activeConversationID })
+    }
+    var sortedConversations: [LocalConversation] {
+        conversations.sorted {
+            if $0.pinned != $1.pinned { return $0.pinned }
+            return $0.updatedAt > $1.updatedAt
+        }
+    }
+    private let archiveURL: URL = {
+        FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("LocalLens-conversations.json")
+    }()
     @Published var status = "Select a language model to begin."
     @Published var loading = false
     @Published var generating = false
@@ -51,12 +68,33 @@ final class LocalRuntime: ObservableObject {
     private static let conversationKey = "locallens.v3.messages"
 
     init() {
-        if let data = UserDefaults.standard.data(forKey: Self.conversationKey),
-           let previous = try? JSONDecoder().decode([LocalChat].self, from: data) {
-            messages = Array(previous.suffix(150))
-            if !messages.isEmpty {
-                status = "Chat restored. Load a model to resume."
-            }
+        if let data = try? Data(contentsOf: archiveURL),
+           let restored = try? JSONDecoder().decode([LocalConversation].self, from: data) {
+            conversations = restored
+        }
+        // Import previous v3 single conversation without deleting it.
+        if conversations.isEmpty,
+           let data = UserDefaults.standard.data(forKey: Self.conversationKey),
+           let previous = try? JSONDecoder().decode([LocalChat].self, from: data),
+           !previous.isEmpty {
+            var migrated = LocalConversation(title: "Recovered conversation",
+                                            messages: previous)
+            migrated.updatedAt = Date()
+            conversations = [migrated]
+            archive()
+        }
+        if conversations.isEmpty {
+            conversations = [LocalConversation()]
+        }
+        activeConversationID = conversations.sorted(by: { $0.updatedAt > $1.updatedAt }).first?.id
+        messages = activeConversation?.messages ?? []
+        // Replace incomplete in-flight responses after abnormal termination.
+        if let last = messages.last, last.role == "assistant", last.text.isEmpty {
+            messages[messages.count - 1].text = "Response interrupted. Try again."
+            persist()
+        }
+        if !messages.isEmpty {
+            status = "Conversation restored · Load a model to resume"
         }
         refreshMemoryStatus()
     }
@@ -96,9 +134,95 @@ final class LocalRuntime: ObservableObject {
         memoryLastChecked = Date().formatted(date: .omitted, time: .standard)
     }
 
+    private func archive() {
+        guard let data = try? JSONEncoder().encode(conversations) else { return }
+        do {
+            try data.write(to: archiveURL, options: .atomic)
+            conversationNotice = ""
+        } catch {
+            conversationNotice = "Could not save chat: \(error.localizedDescription)"
+        }
+    }
+
     private func persist() {
-        if let data = try? JSONEncoder().encode(Array(messages.suffix(150))) {
-            UserDefaults.standard.set(data, forKey: Self.conversationKey)
+        guard let id = activeConversationID,
+              let index = conversations.firstIndex(where: { $0.id == id }) else { return }
+        conversations[index].messages = messages
+        conversations[index].updatedAt = Date()
+        if conversations[index].title == "New conversation",
+           let question = messages.first(where: { $0.role == "user" })?.text {
+            let cleaned = question.replacingOccurrences(of: "📷 ", with: "")
+                .replacingOccurrences(of: "\n", with: " ")
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            if !cleaned.isEmpty {
+                conversations[index].title = String(cleaned.prefix(54))
+            }
+        }
+        archive()
+    }
+
+    func newConversation() {
+        guard !generating && !loading else { return }
+        persist()
+        let chat = LocalConversation()
+        conversations.insert(chat, at: 0)
+        activeConversationID = chat.id
+        messages = []
+        firstTurn = true
+        archive()
+        resetInferenceConversation()
+    }
+
+    func openConversation(_ id: UUID) {
+        guard !generating && !loading, id != activeConversationID else { return }
+        persist()
+        guard let next = conversations.first(where: { $0.id == id }) else { return }
+        activeConversationID = id
+        messages = next.messages
+        firstTurn = true
+        archive()
+        resetInferenceConversation()
+    }
+
+    func renameConversation(_ id: UUID, to title: String) {
+        let cleaned = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !cleaned.isEmpty,
+              let i = conversations.firstIndex(where: { $0.id == id }) else { return }
+        conversations[i].title = String(cleaned.prefix(80))
+        conversations[i].updatedAt = Date()
+        archive()
+    }
+
+    func togglePin(_ id: UUID) {
+        guard let i = conversations.firstIndex(where: { $0.id == id }) else { return }
+        conversations[i].pinned.toggle()
+        archive()
+    }
+
+    func removeConversation(_ id: UUID) {
+        guard !generating && !loading else { return }
+        conversations.removeAll { $0.id == id }
+        if conversations.isEmpty { conversations = [LocalConversation()] }
+        if activeConversationID == id {
+            let latest = sortedConversations.first!
+            activeConversationID = latest.id
+            messages = latest.messages
+            firstTurn = true
+            resetInferenceConversation()
+        }
+        archive()
+    }
+
+    private func resetInferenceConversation() {
+        guard ready else { return }
+        let sys = gemmaDialect || loadedSystemPrompt.isEmpty
+            ? "" : "<|im_start|>system\n\(loadedSystemPrompt)<|im_end|>\n"
+        queue.async {
+            do {
+                try self.bridge.reset(withSystemPrompt: sys)
+            } catch {
+                DispatchQueue.main.async { self.status = "Conversation reset failed: \(error.localizedDescription)" }
+            }
         }
     }
 
@@ -186,16 +310,7 @@ final class LocalRuntime: ObservableObject {
         messages = []
         persist()
         firstTurn = true
-        guard ready else { return }
-        let sys = gemmaDialect || loadedSystemPrompt.isEmpty
-            ? "" : "<|im_start|>system\n\(loadedSystemPrompt)<|im_end|>\n"
-        queue.async {
-            do {
-                try self.bridge.reset(withSystemPrompt: sys)
-            } catch {
-                DispatchQueue.main.async { self.status = error.localizedDescription }
-            }
-        }
+        resetInferenceConversation()
     }
 
     func stop() { bridge.requestStop() }
@@ -234,15 +349,33 @@ final class LocalRuntime: ObservableObject {
         firstTurn = false
         let mediaMarker = imagePath == nil ? "" : LlamaBridge.mediaMarker() + "\n"
         let gemma = gemmaDialect
+
+        // When returning to an archived conversation, replay recent text turns
+        // into the freshly reset context. Images from old turns are text labels only.
+        let previous = isFirst
+            ? Array(messages.dropLast(2).suffix(12))
+            : []
+        var history = ""
+        for item in previous where !item.text.isEmpty {
+            let role = item.role == "user" ? "user" : (gemma ? "model" : "assistant")
+            let safeText = String(item.text.suffix(3000))
+            if gemma {
+                history += "<start_of_turn>\(role)\n\(safeText)<end_of_turn>\n"
+            } else {
+                history += "<|im_start|>\(role)\n\(safeText)<|im_end|>\n"
+            }
+        }
+        // Bound the replay to avoid runaway context allocations.
+        history = String(history.suffix(9000))
         let prompt: String
         if gemma {
             let prefix = isFirst ? "" : "<end_of_turn>\n"
             let sys = isFirst && !systemPrompt.isEmpty ? systemPrompt + "\n\n" : ""
-            prompt = prefix + "<start_of_turn>user\n" + sys + mediaMarker + question +
+            prompt = prefix + history + "<start_of_turn>user\n" + sys + mediaMarker + question +
                      "<end_of_turn>\n<start_of_turn>model\n"
         } else {
             let prefix = isFirst ? "" : "<|im_end|>\n"
-            prompt = prefix + "<|im_start|>user\n" + mediaMarker + question +
+            prompt = prefix + history + "<|im_start|>user\n" + mediaMarker + question +
                      "<|im_end|>\n<|im_start|>assistant\n"
         }
         let imagePaths: [String] = imagePath.map { [$0] } ?? []
@@ -296,7 +429,11 @@ final class LocalRuntime: ObservableObject {
                 }
             }, onDone: { success, message, stats in
                 let elapsed = Date().timeIntervalSince(started)
+                let finalOutput = accumulated
                 DispatchQueue.main.async {
+                    if let index = self.messages.firstIndex(where: { $0.id == answerID }) {
+                        self.messages[index].text = finalOutput
+                    }
                     self.generating = false
                     self.lastStats = (stats ?? "") + String(format: " · %.1fs", elapsed)
                     if !success {
