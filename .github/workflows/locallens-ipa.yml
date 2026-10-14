@@ -1,8 +1,8 @@
-name: LocalLens Standalone IPA
+name: LocalLens v2 IPA
 on:
   push:
     branches:
-      - local-lens-standalone-20261013
+      - locallens-v2-20261013
     paths:
       - "LocalLens/**"
       - ".github/workflows/locallens-ipa.yml"
@@ -31,6 +31,11 @@ jobs:
           cp upstream/src/openTihui/Bridge/LlamaBridge.mm LocalLens/Sources/
           cp upstream/LICENSE LocalLens/UPSTREAM-LICENSE.txt
           test -f LocalLens/Vendor/llama.xcframework/Info.plist
+      - name: Generate full-resolution app icon
+        run: |
+          set -euo pipefail
+          swift LocalLens/Support/generate_icon.swift LocalLens/Sources/Assets.xcassets/AppIcon.appiconset/AppIcon.png
+          sips -g pixelWidth -g pixelHeight LocalLens/Sources/Assets.xcassets/AppIcon.appiconset/AppIcon.png
       - name: Generate Xcode project
         run: |
           cd LocalLens
@@ -46,15 +51,17 @@ jobs:
           test -f "$APP/LocalLens"
           test -f "$APP/Info.plist"
           test -d "$APP/Frameworks/llama.framework"
+          test -f "$APP/Assets.car"
+          /usr/libexec/PlistBuddy -c "Print :CFBundleIcons:CFBundlePrimaryIcon:CFBundleIconName" "$APP/Info.plist" | grep -qx "AppIcon"
           /usr/libexec/PlistBuddy -c "Print :CFBundleIdentifier" "$APP/Info.plist"
           /usr/libexec/PlistBuddy -c "Print :CFBundleExecutable" "$APP/Info.plist"
           mkdir -p dist/Payload
           cp -R "$APP" dist/Payload/
-          (cd dist && zip -q -r ../LocalLens-Standalone-v1.ipa Payload)
-          unzip -t LocalLens-Standalone-v1.ipa | tail -n 1
-          ls -lh LocalLens-Standalone-v1.ipa
+          (cd dist && zip -q -r ../LocalLens-v2.ipa Payload)
+          unzip -t LocalLens-v2.ipa | tail -n 1
+          ls -lh LocalLens-v2.ipa
       - uses: actions/upload-artifact@v4
         with:
-          name: LocalLens-Standalone-v1-IPA
-          path: LocalLens-Standalone-v1.ipa
+          name: LocalLens-v2-IPA
+          path: LocalLens-v2.ipa
           if-no-files-found: error
