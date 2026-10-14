@@ -1,0 +1,60 @@
+name: LocalLens Standalone IPA
+on:
+  push:
+    branches:
+      - local-lens-standalone-20261013
+    paths:
+      - "LocalLens/**"
+      - ".github/workflows/locallens-ipa.yml"
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  ios:
+    runs-on: macos-15
+    timeout-minutes: 115
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build tools
+        run: |
+          brew install cmake ninja xcodegen
+      - name: Build Metal + multimodal llama.cpp
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --depth 1 https://github.com/cyyself/OpenTihui.git upstream
+          git -C upstream submodule update --init --depth 1 llama.cpp
+          (cd upstream/llama.cpp && bash ../scripts/build-llama-ios.sh)
+          mkdir -p LocalLens/Vendor LocalLens/Sources LocalLens/Support
+          cp -R upstream/llama.cpp/build-apple/llama.xcframework LocalLens/Vendor/
+          cp upstream/src/openTihui/Bridge/LlamaBridge.h LocalLens/Sources/
+          cp upstream/src/openTihui/Bridge/LlamaBridge.mm LocalLens/Sources/
+          cp upstream/LICENSE LocalLens/UPSTREAM-LICENSE.txt
+          test -f LocalLens/Vendor/llama.xcframework/Info.plist
+      - name: Generate Xcode project
+        run: |
+          cd LocalLens
+          xcodegen generate
+      - name: Build unsigned device app
+        run: |
+          xcodebuild -project LocalLens/LocalLens.xcodeproj -scheme LocalLens -configuration Release -sdk iphoneos -destination 'generic/platform=iOS' -derivedDataPath "$PWD/DerivedData" build CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY=""
+      - name: Package unsigned IPA and verify app
+        shell: bash
+        run: |
+          set -euo pipefail
+          APP="$PWD/DerivedData/Build/Products/Release-iphoneos/LocalLens.app"
+          test -f "$APP/LocalLens"
+          test -f "$APP/Info.plist"
+          test -d "$APP/Frameworks/llama.framework"
+          /usr/libexec/PlistBuddy -c "Print :CFBundleIdentifier" "$APP/Info.plist"
+          /usr/libexec/PlistBuddy -c "Print :CFBundleExecutable" "$APP/Info.plist"
+          mkdir -p dist/Payload
+          cp -R "$APP" dist/Payload/
+          (cd dist && zip -q -r ../LocalLens-Standalone-v1.ipa Payload)
+          unzip -t LocalLens-Standalone-v1.ipa | tail -n 1
+          ls -lh LocalLens-Standalone-v1.ipa
+      - uses: actions/upload-artifact@v4
+        with:
+          name: LocalLens-Standalone-v1-IPA
+          path: LocalLens-Standalone-v1.ipa
+          if-no-files-found: error

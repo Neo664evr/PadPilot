@@ -1,0 +1,3 @@
+LocalLens is an independent SwiftUI application.
+Inference backend: LlamaBridge originally from OpenTihui by Yangyu Chen, licensed under MIT. The original license is included at build time. The native model engine is llama.cpp by ggml-org and contributors under MIT.
+Models remain local to the iOS app sandbox; the app does not send inference requests to a server.

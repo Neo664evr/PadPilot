@@ -1,0 +1,40 @@
+name: LocalLens
+options:
+  bundleIdPrefix: app.offline
+settings:
+  base:
+    SWIFT_VERSION: "5.0"
+    IPHONEOS_DEPLOYMENT_TARGET: "17.0"
+    CLANG_ENABLE_MODULES: YES
+    ENABLE_BITCODE: NO
+targets:
+  LocalLens:
+    type: application
+    platform: iOS
+    deploymentTarget: "17.0"
+    sources:
+      - path: Sources
+    info:
+      path: Info.plist
+      properties:
+        CFBundleDisplayName: LocalLens
+        CFBundleShortVersionString: "1.0"
+        CFBundleVersion: "1"
+        UILaunchScreen:
+          UIColorName: ""
+        UIFileSharingEnabled: true
+        LSSupportsOpeningDocumentsInPlace: true
+        NSPhotoLibraryUsageDescription: "Choose images to analyze with the on-device model."
+        ITSAppUsesNonExemptEncryption: false
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: app.offline.locallens
+        PRODUCT_NAME: LocalLens
+        SWIFT_OBJC_BRIDGING_HEADER: Support/Bridge.h
+        HEADER_SEARCH_PATHS: "$(inherited) $(SRCROOT)/Sources"
+        CODE_SIGN_STYLE: Manual
+        TARGETED_DEVICE_FAMILY: "1,2"
+    dependencies:
+      - framework: Vendor/llama.xcframework
+        embed: true
+        codeSign: false
