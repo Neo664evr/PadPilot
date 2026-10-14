@@ -311,6 +311,22 @@ final class ModelFiles: ObservableObject {
         projectors = gguf.filter { $0.lastPathComponent.lowercased().contains("mmproj") }
     }
 
+    func deleteFile(_ file: URL) {
+        let safe = file.standardizedFileURL.path
+        let root = directory.standardizedFileURL.path + "/"
+        guard safe.hasPrefix(root), safe.lowercased().hasSuffix(".gguf") else {
+            notice = "Cannot delete a file outside the model library."
+            return
+        }
+        do {
+            try FileManager.default.removeItem(at: file)
+            refresh()
+            notice = "Deleted \(file.lastPathComponent)"
+        } catch {
+            notice = "Delete failed: \(error.localizedDescription)"
+        }
+    }
+
     func importFile(_ picked: URL, asProjector: Bool = false) {
         let access = picked.startAccessingSecurityScopedResource()
         defer { if access { picked.stopAccessingSecurityScopedResource() } }
@@ -324,7 +340,7 @@ final class ModelFiles: ObservableObject {
             : incomingName
         var dest = directory.appendingPathComponent(savedName)
         if FileManager.default.fileExists(atPath: dest.path) {
-            let stem = picked.deletingPathExtension().lastPathComponent
+            let stem = dest.deletingPathExtension().lastPathComponent
             var n = 2
             repeat {
                 dest = directory.appendingPathComponent("\(stem)-\(n).gguf")
@@ -339,6 +355,18 @@ final class ModelFiles: ObservableObject {
             notice = "Import failed: \(error.localizedDescription)"
         }
     }
+}
+
+final class SpeechPlayer: ObservableObject {
+    private let synthesizer = AVSpeechSynthesizer()
+    func speak(_ text: String) {
+        guard !text.isEmpty else { return }
+        synthesizer.stopSpeaking(at: .immediate)
+        let utterance = AVSpeechUtterance(string: text)
+        utterance.rate = 0.49
+        synthesizer.speak(utterance)
+    }
+    func stop() { synthesizer.stopSpeaking(at: .immediate) }
 }
 
 @main
@@ -363,6 +391,25 @@ struct LocalLensView: View {
     @State private var input = ""
     @State private var imageItem: PhotosPickerItem?
     @State private var imageURL: URL?
+    @StateObject private var speaker = SpeechPlayer()
+    @State private var settingsOpen = false
+    @State private var pendingDeletion: URL?
+    @State private var showDeleteDialog = false
+    @State private var imageNotice = ""
+
+    @AppStorage("LL.v3.context") private var contextLength = 4096
+    @AppStorage("LL.v3.gpuLayers") private var gpuLayers = 999
+    @AppStorage("LL.v3.maxTokens") private var maxTokens = 768
+    @AppStorage("LL.v3.temperature") private var temperature = 0.7
+    @AppStorage("LL.v3.topP") private var topP = 0.95
+    @AppStorage("LL.v3.topK") private var topK = 40
+    @AppStorage("LL.v3.reasoningBudget") private var reasoningBudget = 0
+    @AppStorage("LL.v3.minImageFreeMB") private var minImageFreeMB = 1400
+    @AppStorage("LL.v3.imageSize") private var imageSize = 512
+    @AppStorage("LL.v3.systemPrompt") private var systemPrompt = ""
+    @AppStorage("LL.v3.stopWords") private var stopWords = ""
+    @AppStorage("LL.v3.tts") private var readAloud = false
+
 
     private let background = Color(red: 0.035, green: 0.055, blue: 0.09)
     private let panel = Color(red: 0.075, green: 0.105, blue: 0.16)
@@ -396,26 +443,83 @@ struct LocalLensView: View {
                 }
             }
         }
+        .confirmationDialog(
+            "Delete \(pendingDeletion?.lastPathComponent ?? "model")?",
+            isPresented: $showDeleteDialog,
+            titleVisibility: .visible
+        ) {
+            Button("Delete file permanently", role: .destructive) {
+                if let url = pendingDeletion {
+                    if url.path == runtime.loadedModelPath || url.path == runtime.loadedProjectorPath {
+                        files.notice = "Offload the active model before deleting this file."
+                    } else {
+                        files.deleteFile(url)
+                        if !files.weights.contains(where: { $0.path == selectedLanguage }) {
+                            selectedLanguage = files.weights.first?.path ?? ""
+                        }
+                        if !files.projectors.contains(where: { $0.path == selectedProjector }) {
+                            selectedProjector = files.projectors.first?.path ?? ""
+                        }
+                    }
+                }
+                pendingDeletion = nil
+            }
+        } message: {
+            Text("This will remove the GGUF from LocalLens storage.")
+        }
+        .sheet(isPresented: $settingsOpen) { settingsSheet }
+        .onChange(of: runtime.generating) { wasGenerating, generating in
+            if wasGenerating && !generating && readAloud,
+               let answer = runtime.messages.last,
+               answer.role == "assistant" {
+                speaker.speak(answer.text)
+            }
+        }
         .onAppear {
             if selectedLanguage.isEmpty { selectedLanguage = files.weights.first?.path ?? "" }
             if selectedProjector.isEmpty { selectedProjector = files.projectors.first?.path ?? "" }
         }
         .onChange(of: imageItem) { _, selected in
             guard let selected else { return }
+            imageNotice = "Preparing image…"
+            let target = max(256, min(1024, imageSize))
             Task {
-                guard let data = try? await selected.loadTransferable(type: Data.self),
-                      let image = UIImage(data: data) else { return }
-                let maxSide: CGFloat = 1024
-                let factor = min(1, maxSide / max(image.size.width, image.size.height))
-                let dimension = CGSize(width: image.size.width * factor, height: image.size.height * factor)
-                let scaled = UIGraphicsImageRenderer(size: dimension).image { _ in
-                    image.draw(in: CGRect(origin: .zero, size: dimension))
+                guard let data = try? await selected.loadTransferable(type: Data.self) else {
+                    imageNotice = "Cannot read that image. Choose another."
+                    return
                 }
-                if let jpeg = scaled.jpegData(compressionQuality: 0.85) {
-                    let path = FileManager.default.temporaryDirectory
-                        .appendingPathComponent("locallens-\(UUID().uuidString).jpg")
-                    try? jpeg.write(to: path)
-                    imageURL = path
+                // Downsampling through ImageIO avoids fully decoding large photos.
+                // UIImage(data:) at original resolution can add hundreds of MB.
+                if data.count > 35_000_000 {
+                    imageNotice = "Image is too large (35 MB limit)."
+                    return
+                }
+                let prepared = await Task.detached(priority: .userInitiated) {
+                    () -> URL? in
+                    autoreleasepool {
+                        guard let src = CGImageSourceCreateWithData(data as CFData, nil),
+                              let image = CGImageSourceCreateThumbnailAtIndex(src, 0, [
+                                kCGImageSourceCreateThumbnailFromImageAlways: true,
+                                kCGImageSourceCreateThumbnailWithTransform: true,
+                                kCGImageSourceThumbnailMaxPixelSize: target,
+                                kCGImageSourceShouldCacheImmediately: false
+                              ] as CFDictionary)
+                        else { return nil }
+                        let reduced = UIImage(cgImage: image)
+                        guard let jpeg = reduced.jpegData(compressionQuality: 0.72) else { return nil }
+                        let path = FileManager.default.temporaryDirectory
+                            .appendingPathComponent("locallens-\(UUID().uuidString).jpg")
+                        do {
+                            try jpeg.write(to: path, options: .atomic)
+                            return path
+                        } catch { return nil }
+                    }
+                }.value
+                if let prepared {
+                    imageURL = prepared
+                    imageNotice = ""
+                } else {
+                    imageNotice = "Image preparation failed; no image sent."
                 }
             }
         }
@@ -443,6 +547,14 @@ struct LocalLensView: View {
                         .foregroundStyle(.gray)
                 }
                 Spacer()
+                Button { settingsOpen = true } label: {
+                    Image(systemName: "slider.horizontal.3")
+                        .font(.system(size: 17))
+                        .foregroundStyle(mint)
+                        .frame(width: 40, height: 40)
+                        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 12))
+                }
+                .accessibilityLabel("Settings")
                 HStack(spacing: 6) {
                     Circle()
                         .fill(runtime.ready ? mint : Color.gray)
@@ -515,7 +627,7 @@ struct LocalLensView: View {
                     }
                     actionButton(runtime.loading ? "Loading…" : "Load text model",
                                  "play.fill", color: mint, textColor: background) {
-                        runtime.load(modelPath: selectedLanguage, projectorPath: nil)
+                        runtime.load(modelPath: selectedLanguage, projectorPath: nil, context: contextLength, gpuLayers: gpuLayers, systemPrompt: systemPrompt)
                     }
                     .disabled(!canLoadLanguage)
                     .opacity(canLoadLanguage ? 1 : 0.45)
@@ -542,7 +654,7 @@ struct LocalLensView: View {
                     }
                     actionButton(runtime.loading ? "Loading…" : "Load vision with model",
                                  "eye.fill", color: azure, textColor: background) {
-                        runtime.load(modelPath: selectedLanguage, projectorPath: selectedProjector)
+                        runtime.load(modelPath: selectedLanguage, projectorPath: selectedProjector, context: contextLength, gpuLayers: gpuLayers, systemPrompt: systemPrompt)
                     }
                     .disabled(!canLoadVision)
                     .opacity(canLoadVision ? 1 : 0.45)
@@ -562,6 +674,19 @@ struct LocalLensView: View {
                             .foregroundStyle(.gray)
                         Spacer()
                         if runtime.loading { ProgressView().tint(mint) }
+                    }
+                    if runtime.ready {
+                        Button("Offload current model", systemImage: "eject") { runtime.unload() }
+                            .font(.system(size: 13, weight: .semibold))
+                            .disabled(busy)
+                    }
+                    Text(runtime.memoryStatus)
+                        .font(.system(size: 12, design: .monospaced))
+                        .foregroundStyle(.gray)
+                    if !runtime.lastStats.isEmpty {
+                        Text(runtime.lastStats)
+                            .font(.caption.monospaced())
+                            .foregroundStyle(.gray)
                     }
                     Text(runtime.status)
                         .font(.system(size: 13, weight: .medium))
@@ -639,30 +764,51 @@ struct LocalLensView: View {
     private func selectableFile(_ url: URL, selected: Bool, tint: Color,
                                 action: @escaping () -> Void) -> some View {
         let bytes = (try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
-        return Button(action: action) {
-            HStack(spacing: 11) {
-                Image(systemName: selected ? "checkmark.circle.fill" : "circle")
-                    .font(.system(size: 22))
-                    .foregroundStyle(selected ? tint : .gray)
-                VStack(alignment: .leading, spacing: 5) {
-                    Text(url.lastPathComponent)
-                        .font(.system(size: 12, weight: .semibold))
-                        .lineLimit(2)
-                        .multilineTextAlignment(.leading)
-                        .foregroundStyle(.white)
-                    Text(ByteCountFormatter.string(fromByteCount: Int64(bytes), countStyle: .file))
-                        .font(.system(size: 11, design: .monospaced))
-                        .foregroundStyle(.gray)
+        return HStack(spacing: 6) {
+            Button(action: action) {
+                HStack(spacing: 11) {
+                    Image(systemName: selected ? "checkmark.circle.fill" : "circle")
+                        .font(.system(size: 22))
+                        .foregroundStyle(selected ? tint : .gray)
+                    VStack(alignment: .leading, spacing: 5) {
+                        Text(url.lastPathComponent)
+                            .font(.system(size: 12, weight: .semibold))
+                            .lineLimit(2)
+                            .multilineTextAlignment(.leading)
+                            .foregroundStyle(.white)
+                        Text(ByteCountFormatter.string(fromByteCount: Int64(bytes), countStyle: .file))
+                            .font(.system(size: 11, design: .monospaced))
+                            .foregroundStyle(.gray)
+                    }
+                    Spacer(minLength: 0)
                 }
-                Spacer(minLength: 0)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(11)
             }
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .padding(12)
-            .background(selected ? tint.opacity(0.12) : panelRaised, in: RoundedRectangle(cornerRadius: 13))
-            .overlay(RoundedRectangle(cornerRadius: 13)
-                .strokeBorder(selected ? tint.opacity(0.5) : Color.white.opacity(0.055), lineWidth: 1))
+            .buttonStyle(.plain)
+            Button(role: .destructive) {
+                pendingDeletion = url
+                showDeleteDialog = true
+            } label: {
+                Image(systemName: "trash")
+                    .font(.system(size: 15))
+                    .foregroundStyle(.red.opacity(0.8))
+                    .frame(width: 37, height: 42)
+            }
+            .buttonStyle(.plain)
+            .disabled(busy || url.path == runtime.loadedModelPath || url.path == runtime.loadedProjectorPath)
+            .accessibilityLabel("Delete \(url.lastPathComponent)")
         }
-        .buttonStyle(.plain)
+        .background(selected ? tint.opacity(0.12) : panelRaised,
+                    in: RoundedRectangle(cornerRadius: 13))
+        .overlay(RoundedRectangle(cornerRadius: 13)
+            .strokeBorder(selected ? tint.opacity(0.5) : Color.white.opacity(0.055), lineWidth: 1))
+        .swipeActions(edge: .trailing, allowsFullSwipe: false) {
+            Button("Delete", role: .destructive) {
+                pendingDeletion = url
+                showDeleteDialog = true
+            }
+        }
     }
 
     private func actionButton(_ title: String, _ icon: String, color: Color,
@@ -678,6 +824,101 @@ struct LocalLensView: View {
             .background(color, in: RoundedRectangle(cornerRadius: 12))
         }
         .buttonStyle(.plain)
+    }
+
+    private var settingsSheet: some View {
+        NavigationStack {
+            Form {
+                Section("Runtime & Memory") {
+                    Picker("Context window", selection: $contextLength) {
+                        Text("2,048").tag(2048)
+                        Text("4,096").tag(4096)
+                        Text("8,192").tag(8192)
+                        Text("16,384").tag(16384)
+                    }
+                    Picker("Metal GPU layers", selection: $gpuLayers) {
+                        Text("CPU only").tag(0)
+                        Text("20 layers").tag(20)
+                        Text("40 layers").tag(40)
+                        Text("All available").tag(999)
+                    }
+                    Picker("Image resolution", selection: $imageSize) {
+                        Text("256px · safest").tag(256)
+                        Text("512px · recommended").tag(512)
+                        Text("768px").tag(768)
+                        Text("1024px · higher memory").tag(1024)
+                    }
+                    Picker("Minimum free RAM for image processing", selection: $minImageFreeMB) {
+                        Text("1,000 MB").tag(1000)
+                        Text("1,400 MB · recommended").tag(1400)
+                        Text("1,800 MB · safer").tag(1800)
+                        Text("2,400 MB · most conservative").tag(2400)
+                    }
+                    Text("Changes to GPU and context take effect when you next load a model.")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                }
+                Section("Generation") {
+                    Stepper("Maximum tokens: \(maxTokens)", value: $maxTokens, in: 64...4096, step: 64)
+                    VStack(alignment: .leading) {
+                        Text(String(format: "Temperature: %.2f", temperature))
+                        Slider(value: $temperature, in: 0...1.5, step: 0.05)
+                    }
+                    VStack(alignment: .leading) {
+                        Text(String(format: "Top P: %.2f", topP))
+                        Slider(value: $topP, in: 0.1...1, step: 0.05)
+                    }
+                    Stepper("Top K: \(topK)", value: $topK, in: 0...200, step: 5)
+                    Picker("Reasoning budget", selection: $reasoningBudget) {
+                        Text("Unrestricted").tag(0)
+                        Text("256 tokens").tag(256)
+                        Text("768 tokens").tag(768)
+                    }
+                }
+                Section("Prompt & Conversation") {
+                    TextField("System prompt", text: $systemPrompt, axis: .vertical)
+                        .lineLimit(3...7)
+                    TextField("Stop sequences (one per line)", text: $stopWords, axis: .vertical)
+                        .lineLimit(2...5)
+                    Toggle("Read finished answers aloud", isOn: $readAloud)
+                    Button("Clear current chat", role: .destructive) { runtime.reset() }
+                        .disabled(busy)
+                    Text("Chats are stored locally and restored after reopening.")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                }
+                Section("Connectivity") {
+                    HStack {
+                        Label("MCP tools", systemImage: "network")
+                        Spacer()
+                        Text("Coming Soon").foregroundStyle(.secondary)
+                    }
+                    Link(destination: URL(string: "https://huggingface.co/models?library=gguf")!) {
+                        Label("Browse GGUF models on Hugging Face", systemImage: "arrow.up.right.square")
+                    }
+                    Text("Web search and remote tool execution are not enabled in this build.")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                }
+                Section("Diagnostics") {
+                    Text(runtime.memoryStatus)
+                    Text(runtime.lastStats.isEmpty ? "No generation statistics yet." : runtime.lastStats)
+                        .textSelection(.enabled)
+                    Button("Refresh memory reading") { runtime.refreshMemoryStatus() }
+                    Text("If iOS memory is too low, sending a photo is blocked instead of invoking the image encoder.")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .navigationTitle("Settings")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Done") { settingsOpen = false }
+                }
+            }
+        }
+        .presentationDragIndicator(.visible)
     }
 
     private var chatPanel: some View {
@@ -752,6 +993,11 @@ struct LocalLensView: View {
                     }
                 }
             }
+            if !imageNotice.isEmpty {
+                Text(imageNotice).font(.caption).foregroundStyle(.orange)
+                    .padding(.horizontal, 19)
+                    .padding(.vertical, 5)
+            }
             if imageURL != nil {
                 HStack {
                     Image(systemName: "photo.fill").foregroundStyle(mint)
@@ -788,10 +1034,24 @@ struct LocalLensView: View {
                     }
                 } else {
                     Button {
-                        runtime.send(text: input, imagePath: imageURL?.path)
-                        input = ""
-                        imageURL = nil
-                        imageItem = nil
+                        let applied = runtime.send(
+                            text: input,
+                            imagePath: imageURL?.path,
+                            options: RunSettings(
+                                maxTokens: maxTokens, temperature: Float(temperature),
+                                topP: Float(topP), topK: topK,
+                                reasoningBudget: reasoningBudget,
+                                stopWords: stopWords.components(separatedBy: .newlines)
+                                    .filter { !$0.isEmpty }),
+                            systemPrompt: systemPrompt,
+                            minimumImageMemoryMB: minImageFreeMB
+                        )
+                        if applied {
+                            input = ""
+                            imageURL = nil
+                            imageItem = nil
+                            imageNotice = ""
+                        }
                     } label: {
                         Image(systemName: "arrow.up.circle.fill")
                             .font(.system(size: 30))
@@ -811,8 +1071,7 @@ private extension View {
     func cardSurface() -> some View {
         self.padding(17)
             .frame(maxWidth: .infinity, alignment: .leading)
-            .background(Color(red: 0.075, green: 0.105, blue: 0.16),
-                        in: RoundedRectangle(cornerRadius: 22))
+            .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 22))
             .overlay(RoundedRectangle(cornerRadius: 22)
                 .strokeBorder(Color.white.opacity(0.06), lineWidth: 1))
     }
