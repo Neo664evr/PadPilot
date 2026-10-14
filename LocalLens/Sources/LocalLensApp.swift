@@ -17,7 +17,7 @@ struct LocalChat: Identifiable {
 
 final class LocalRuntime: ObservableObject {
     @Published var messages: [LocalChat] = []
-    @Published var status = "Import a GGUF model to begin."
+    @Published var status = "Select a language model to begin."
     @Published var loading = false
     @Published var generating = false
     @Published var ready = false
@@ -163,14 +163,18 @@ final class ModelFiles: ObservableObject {
         projectors = gguf.filter { $0.lastPathComponent.lowercased().contains("mmproj") }
     }
 
-    func importFile(_ picked: URL) {
+    func importFile(_ picked: URL, asProjector: Bool = false) {
         let access = picked.startAccessingSecurityScopedResource()
         defer { if access { picked.stopAccessingSecurityScopedResource() } }
         guard picked.pathExtension.lowercased() == "gguf" else {
             notice = "Only .gguf files are supported."
             return
         }
-        var dest = directory.appendingPathComponent(picked.lastPathComponent)
+        let incomingName = picked.lastPathComponent
+        let savedName = asProjector && !incomingName.lowercased().contains("mmproj")
+            ? "mmproj-" + incomingName
+            : incomingName
+        var dest = directory.appendingPathComponent(savedName)
         if FileManager.default.fileExists(atPath: dest.path) {
             let stem = picked.deletingPathExtension().lastPathComponent
             var n = 2
@@ -193,66 +197,62 @@ final class ModelFiles: ObservableObject {
 struct LocalLensApp: App {
     var body: some Scene {
         WindowGroup {
-            LocalLensView()
-                .preferredColorScheme(.dark)
+            LocalLensView().preferredColorScheme(.dark)
         }
     }
 }
 
+private enum ImportRole { case language, vision }
+
 struct LocalLensView: View {
     @StateObject private var files = ModelFiles()
     @StateObject private var runtime = LocalRuntime()
-    @State private var modelPath = ""
-    @State private var projPath = ""
+    @State private var selectedLanguage = ""
+    @State private var selectedProjector = ""
+    @State private var importRole: ImportRole = .language
+    @State private var isImporting = false
+    @State private var page = 0
     @State private var input = ""
-    @State private var importing = false
-    @State private var pickerItem: PhotosPickerItem?
-    @State private var attachedImage: URL?
-    @State private var tab = 0
+    @State private var imageItem: PhotosPickerItem?
+    @State private var imageURL: URL?
 
-    private let tint = Color(red: 0.48, green: 0.72, blue: 1.0)
+    private let background = Color(red: 0.035, green: 0.055, blue: 0.09)
+    private let panel = Color(red: 0.075, green: 0.105, blue: 0.16)
+    private let panelRaised = Color(red: 0.105, green: 0.145, blue: 0.21)
+    private let mint = Color(red: 0.42, green: 0.94, blue: 0.78)
+    private let azure = Color(red: 0.48, green: 0.68, blue: 1.0)
+
     private var ggufType: UTType { UTType(filenameExtension: "gguf") ?? .data }
+    private var busy: Bool { runtime.loading || runtime.generating }
+    private var canLoadLanguage: Bool { !selectedLanguage.isEmpty && !busy }
+    private var canLoadVision: Bool { !selectedLanguage.isEmpty && !selectedProjector.isEmpty && !busy }
 
     var body: some View {
         VStack(spacing: 0) {
-            HStack {
-                Image(systemName: "circle.hexagongrid.fill")
-                    .foregroundStyle(tint)
-                Text("LocalLens")
-                    .font(.system(size: 23, weight: .bold, design: .rounded))
-                Spacer()
-                Text("OFFLINE")
-                    .font(.caption2.monospaced().weight(.bold))
-                    .foregroundStyle(.secondary)
-                Circle()
-                    .fill(runtime.ready ? .green : .gray)
-                    .frame(width: 8, height: 8)
-            }
-            .padding(.horizontal, 22)
-            .padding(.vertical, 18)
-
-            Picker("View", selection: $tab) {
-                Text("Chat").tag(0)
-                Text("Models").tag(1)
-            }
-            .pickerStyle(.segmented)
-            .padding(.horizontal, 20)
-            .padding(.bottom, 12)
-
-            if tab == 0 { chatPanel } else { modelPanel }
+            header
+            if page == 0 { chatPanel } else { modelPanel }
         }
-        .background(Color(red: 0.055, green: 0.075, blue: 0.10))
-        .tint(tint)
-        .fileImporter(isPresented: $importing, allowedContentTypes: [ggufType, .data]) { result in
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(background.ignoresSafeArea())
+        .fileImporter(isPresented: $isImporting, allowedContentTypes: [ggufType, .data]) { result in
             switch result {
-            case .success(let url):
-                files.importFile(url)
-                if modelPath.isEmpty, let first = files.weights.first { modelPath = first.path }
             case .failure(let error):
                 files.notice = error.localizedDescription
+            case .success(let url):
+                let previous = Set((importRole == .vision ? files.projectors : files.weights).map(\.path))
+                files.importFile(url, asProjector: importRole == .vision)
+                let changed = importRole == .vision ? files.projectors : files.weights
+                if let added = changed.first(where: { !previous.contains($0.path) }) {
+                    if importRole == .vision { selectedProjector = added.path }
+                    else { selectedLanguage = added.path }
+                }
             }
         }
-        .onChange(of: pickerItem) { _, selected in
+        .onAppear {
+            if selectedLanguage.isEmpty { selectedLanguage = files.weights.first?.path ?? "" }
+            if selectedProjector.isEmpty { selectedProjector = files.projectors.first?.path ?? "" }
+        }
+        .onChange(of: imageItem) { _, selected in
             guard let selected else { return }
             Task {
                 guard let data = try? await selected.loadTransferable(type: Data.self),
@@ -260,213 +260,412 @@ struct LocalLensView: View {
                 let maxSide: CGFloat = 1024
                 let factor = min(1, maxSide / max(image.size.width, image.size.height))
                 let dimension = CGSize(width: image.size.width * factor, height: image.size.height * factor)
-                let thumb = UIGraphicsImageRenderer(size: dimension).image { _ in
+                let scaled = UIGraphicsImageRenderer(size: dimension).image { _ in
                     image.draw(in: CGRect(origin: .zero, size: dimension))
                 }
-                if let jpeg = thumb.jpegData(compressionQuality: 0.85) {
-                    let path = FileManager.default.temporaryDirectory.appendingPathComponent("lens-\(UUID().uuidString).jpg")
+                if let jpeg = scaled.jpegData(compressionQuality: 0.85) {
+                    let path = FileManager.default.temporaryDirectory
+                        .appendingPathComponent("locallens-\(UUID().uuidString).jpg")
                     try? jpeg.write(to: path)
-                    attachedImage = path
+                    imageURL = path
                 }
             }
         }
     }
 
+    private var header: some View {
+        VStack(alignment: .leading, spacing: 18) {
+            HStack(spacing: 11) {
+                ZStack {
+                    RoundedRectangle(cornerRadius: 12)
+                        .fill(LinearGradient(colors: [mint.opacity(0.23), azure.opacity(0.12)],
+                                             startPoint: .topLeading, endPoint: .bottomTrailing))
+                        .frame(width: 40, height: 40)
+                    Image(systemName: "circle.hexagongrid.fill")
+                        .font(.system(size: 20))
+                        .foregroundStyle(mint)
+                }
+                VStack(alignment: .leading, spacing: 1) {
+                    Text("LocalLens")
+                        .font(.system(size: 22, weight: .bold, design: .rounded))
+                        .foregroundStyle(.white)
+                    Text("PRIVATE • ON DEVICE")
+                        .font(.system(size: 9, weight: .bold, design: .monospaced))
+                        .tracking(1.1)
+                        .foregroundStyle(.gray)
+                }
+                Spacer()
+                HStack(spacing: 6) {
+                    Circle()
+                        .fill(runtime.ready ? mint : Color.gray)
+                        .frame(width: 7, height: 7)
+                    Text(runtime.ready ? "ONLINE" : "IDLE")
+                        .font(.system(size: 10, weight: .bold, design: .monospaced))
+                        .foregroundStyle(runtime.ready ? mint : .gray)
+                }
+                .padding(.horizontal, 10)
+                .padding(.vertical, 9)
+                .background(panelRaised, in: Capsule())
+            }
+            HStack(spacing: 6) {
+                pageButton("Chat", icon: "bubble.left.and.bubble.right", index: 0)
+                pageButton("Models", icon: "cpu", index: 1)
+            }
+            .padding(5)
+            .background(panel, in: RoundedRectangle(cornerRadius: 16))
+        }
+        .padding(.horizontal, 19)
+        .padding(.top, 9)
+        .padding(.bottom, 15)
+    }
+
+    private func pageButton(_ name: String, icon: String, index: Int) -> some View {
+        Button { withAnimation(.easeInOut(duration: 0.2)) { page = index } } label: {
+            Label(name, systemImage: icon)
+                .font(.system(size: 13, weight: .semibold))
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 12)
+                .foregroundStyle(page == index ? .white : .gray)
+                .background(page == index ? panelRaised : Color.clear,
+                            in: RoundedRectangle(cornerRadius: 12))
+        }
+        .buttonStyle(.plain)
+    }
+
     private var modelPanel: some View {
         ScrollView {
-            VStack(alignment: .leading, spacing: 17) {
-                Text("On-device models")
-                    .font(.title2.bold())
-                Text("Import GGUF weights and matching mmproj projectors from Files. All inference stays on your iPhone.")
-                    .font(.subheadline)
-                    .foregroundStyle(.secondary)
-                Button {
-                    importing = true
-                } label: {
-                    Label("Import GGUF / mmproj", systemImage: "square.and.arrow.down")
-                        .fontWeight(.semibold)
-                        .frame(maxWidth: .infinity, minHeight: 48)
+            VStack(alignment: .leading, spacing: 19) {
+                VStack(alignment: .leading, spacing: 7) {
+                    Text("Model library")
+                        .font(.system(size: 30, weight: .bold, design: .rounded))
+                    Text("Two components. One local intelligence.")
+                        .font(.subheadline)
+                        .foregroundStyle(.gray)
                 }
-                .buttonStyle(.borderedProminent)
+                HStack(spacing: 11) {
+                    numberTile("\(files.weights.count)", "GGUF MODELS", icon: "cpu", color: mint)
+                    numberTile("\(files.projectors.count)", "PROJECTORS", icon: "eye", color: azure)
+                }
 
-                if !files.notice.isEmpty {
-                    Text(files.notice).font(.footnote).foregroundStyle(.secondary)
-                }
-                Text("LANGUAGE MODEL")
-                    .font(.caption.weight(.bold))
-                    .foregroundStyle(.secondary)
-                if files.weights.isEmpty {
-                    Text("No models imported yet.").foregroundStyle(.secondary)
-                } else {
-                    Picker("GGUF", selection: $modelPath) {
-                        Text("Choose a model").tag("")
-                        ForEach(files.weights, id: \.path) { path in
-                            Text(path.lastPathComponent).tag(path.path)
+                // A language model and its vision projector are separate file types.
+                VStack(alignment: .leading, spacing: 14) {
+                    sectionHeading("01", "Language model", "text.bubble.fill", tint: mint)
+                    Text("Choose the GGUF weights to run on your device.")
+                        .font(.caption)
+                        .foregroundStyle(.gray)
+                    if files.weights.isEmpty {
+                        emptyFile("No language models imported")
+                    }
+                    ForEach(files.weights, id: \.path) { file in
+                        selectableFile(file, selected: selectedLanguage == file.path, tint: mint) {
+                            selectedLanguage = file.path
                         }
                     }
-                    .pickerStyle(.menu)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                }
-
-                Text("VISION PROJECTOR")
-                    .font(.caption.weight(.bold))
-                    .foregroundStyle(.secondary)
-                Picker("mmproj", selection: $projPath) {
-                    Text("None (text only)").tag("")
-                    ForEach(files.projectors, id: \.path) { path in
-                        Text(path.lastPathComponent).tag(path.path)
+                    actionButton("Import language model", "plus.circle.fill", color: panelRaised, textColor: mint) {
+                        importRole = .language
+                        isImporting = true
                     }
+                    actionButton(runtime.loading ? "Loading…" : "Load text model",
+                                 "play.fill", color: mint, textColor: background) {
+                        runtime.load(modelPath: selectedLanguage, projectorPath: nil)
+                    }
+                    .disabled(!canLoadLanguage)
+                    .opacity(canLoadLanguage ? 1 : 0.45)
                 }
-                .pickerStyle(.menu)
-                .frame(maxWidth: .infinity, alignment: .leading)
+                .cardSurface()
 
-                Text("A projector must match its GGUF model. Incompatible files will fail to load.")
-                    .font(.footnote)
-                    .foregroundStyle(.secondary)
-                Button {
-                    runtime.load(modelPath: modelPath, projectorPath: projPath.isEmpty ? nil : projPath)
-                } label: {
+                VStack(alignment: .leading, spacing: 14) {
+                    sectionHeading("02", "Vision projector", "eye.fill", tint: azure)
+                    Text("Import the matching mmproj GGUF. Select it below, then load it together with the language model.")
+                        .font(.caption)
+                        .foregroundStyle(.gray)
+                        .fixedSize(horizontal: false, vertical: true)
+                    if files.projectors.isEmpty {
+                        emptyFile("No vision projectors imported")
+                    }
+                    ForEach(files.projectors, id: \.path) { file in
+                        selectableFile(file, selected: selectedProjector == file.path, tint: azure) {
+                            selectedProjector = file.path
+                        }
+                    }
+                    actionButton("Import vision projector", "plus.circle.fill", color: panelRaised, textColor: azure) {
+                        importRole = .vision
+                        isImporting = true
+                    }
+                    actionButton(runtime.loading ? "Loading…" : "Load vision with model",
+                                 "eye.fill", color: azure, textColor: background) {
+                        runtime.load(modelPath: selectedLanguage, projectorPath: selectedProjector)
+                    }
+                    .disabled(!canLoadVision)
+                    .opacity(canLoadVision ? 1 : 0.45)
+                    Label("The projector cannot run by itself. It is loaded with the selected language model.",
+                          systemImage: "info.circle")
+                        .font(.system(size: 11))
+                        .foregroundStyle(.gray)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                .cardSurface()
+
+                VStack(alignment: .leading, spacing: 10) {
                     HStack {
-                        if runtime.loading { ProgressView().tint(.white) }
-                        Image(systemName: "play.fill")
-                        Text(runtime.loading ? "Loading…" : "Load selected model")
+                        Label("ENGINE STATUS", systemImage: "waveform.path.ecg")
+                            .font(.system(size: 11, weight: .bold, design: .monospaced))
+                            .tracking(0.7)
+                            .foregroundStyle(.gray)
+                        Spacer()
+                        if runtime.loading { ProgressView().tint(mint) }
                     }
-                    .frame(maxWidth: .infinity, minHeight: 48)
+                    Text(runtime.status)
+                        .font(.system(size: 13, weight: .medium))
+                        .foregroundStyle(runtime.ready ? mint : .white)
+                        .textSelection(.enabled)
+                    if !files.notice.isEmpty {
+                        Text(files.notice)
+                            .font(.caption)
+                            .foregroundStyle(.gray)
+                    }
+                    if runtime.ready {
+                        Button { page = 0 } label: {
+                            HStack {
+                                Text("Open chat")
+                                Spacer()
+                                Image(systemName: "arrow.up.right")
+                            }
+                            .font(.system(size: 14, weight: .bold))
+                        }
+                        .buttonStyle(.bordered)
+                    }
                 }
-                .buttonStyle(.borderedProminent)
-                .disabled(modelPath.isEmpty || runtime.loading || runtime.generating)
-                Text(runtime.status)
-                    .font(.footnote.monospaced())
-                    .foregroundStyle(runtime.ready ? .green : .secondary)
-                    .textSelection(.enabled)
-                Button("Open chat") { tab = 0 }
-                    .disabled(!runtime.ready)
-
-                Divider()
-                Text("Files → On My iPhone → LocalLens → Models")
-                    .font(.footnote)
-                    .foregroundStyle(.secondary)
-                Text("Tip: Reimport files from the Files app; another app's private storage cannot be read directly.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+                .cardSurface()
+                Text("FILES APP  ·  On My iPhone → LocalLens → Models")
+                    .font(.system(size: 10, weight: .medium, design: .monospaced))
+                    .foregroundStyle(.gray)
+                    .padding(.bottom, 15)
             }
-            .padding(22)
+            .padding(.horizontal, 19)
+            .padding(.bottom, 25)
         }
+    }
+
+    private func numberTile(_ value: String, _ caption: String, icon: String, color: Color) -> some View {
+        HStack(spacing: 12) {
+            Image(systemName: icon)
+                .font(.system(size: 21))
+                .foregroundStyle(color)
+                .frame(width: 34)
+            VStack(alignment: .leading, spacing: 3) {
+                Text(value).font(.system(size: 24, weight: .bold, design: .rounded))
+                    .foregroundStyle(.white)
+                Text(caption)
+                    .font(.system(size: 9, weight: .bold, design: .monospaced))
+                    .foregroundStyle(.gray)
+            }
+            Spacer(minLength: 0)
+        }
+        .padding(13)
+        .frame(maxWidth: .infinity)
+        .background(panel, in: RoundedRectangle(cornerRadius: 17))
+    }
+
+    private func sectionHeading(_ count: String, _ name: String, _ icon: String, tint: Color) -> some View {
+        HStack(spacing: 10) {
+            Text(count)
+                .font(.system(size: 12, weight: .bold, design: .monospaced))
+                .foregroundStyle(tint)
+            Image(systemName: icon)
+                .foregroundStyle(tint)
+            Text(name)
+                .font(.system(size: 18, weight: .bold, design: .rounded))
+                .foregroundStyle(.white)
+        }
+    }
+
+    private func emptyFile(_ message: String) -> some View {
+        Label(message, systemImage: "tray")
+            .font(.system(size: 13))
+            .foregroundStyle(.gray)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.vertical, 15)
+    }
+
+    private func selectableFile(_ url: URL, selected: Bool, tint: Color,
+                                action: @escaping () -> Void) -> some View {
+        let bytes = (try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
+        return Button(action: action) {
+            HStack(spacing: 11) {
+                Image(systemName: selected ? "checkmark.circle.fill" : "circle")
+                    .font(.system(size: 22))
+                    .foregroundStyle(selected ? tint : .gray)
+                VStack(alignment: .leading, spacing: 5) {
+                    Text(url.lastPathComponent)
+                        .font(.system(size: 12, weight: .semibold))
+                        .lineLimit(2)
+                        .multilineTextAlignment(.leading)
+                        .foregroundStyle(.white)
+                    Text(ByteCountFormatter.string(fromByteCount: Int64(bytes), countStyle: .file))
+                        .font(.system(size: 11, design: .monospaced))
+                        .foregroundStyle(.gray)
+                }
+                Spacer(minLength: 0)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(12)
+            .background(selected ? tint.opacity(0.12) : panelRaised, in: RoundedRectangle(cornerRadius: 13))
+            .overlay(RoundedRectangle(cornerRadius: 13)
+                .strokeBorder(selected ? tint.opacity(0.5) : Color.white.opacity(0.055), lineWidth: 1))
+        }
+        .buttonStyle(.plain)
+    }
+
+    private func actionButton(_ title: String, _ icon: String, color: Color,
+                              textColor: Color, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            HStack(spacing: 9) {
+                Image(systemName: icon)
+                Text(title)
+            }
+            .font(.system(size: 13, weight: .bold))
+            .frame(maxWidth: .infinity, minHeight: 44)
+            .foregroundStyle(textColor)
+            .background(color, in: RoundedRectangle(cornerRadius: 12))
+        }
+        .buttonStyle(.plain)
     }
 
     private var chatPanel: some View {
         VStack(spacing: 0) {
             HStack(spacing: 8) {
-                Image(systemName: runtime.vision ? "eye.fill" : "cpu")
+                Circle().fill(runtime.ready ? mint : Color.gray).frame(width: 7, height: 7)
                 Text(runtime.status)
+                    .font(.system(size: 12, weight: .medium))
                     .lineLimit(2)
+                    .foregroundStyle(.gray)
                 Spacer()
-                Button {
-                    runtime.reset()
-                } label: {
-                    Image(systemName: "arrow.counterclockwise")
+                if runtime.ready {
+                    Button {
+                        runtime.reset()
+                    } label: {
+                        Image(systemName: "arrow.counterclockwise")
+                            .foregroundStyle(mint)
+                    }
+                    .disabled(busy)
                 }
-                .disabled(!runtime.ready || runtime.generating)
             }
-            .font(.caption)
-            .foregroundStyle(.secondary)
-            .padding(.horizontal, 20)
-            .padding(.vertical, 9)
-
-            ScrollViewReader { proxy in
+            .padding(.horizontal, 19)
+            .padding(.vertical, 10)
+            Divider().overlay(Color.white.opacity(0.04))
+            ScrollViewReader { scroll in
                 ScrollView {
-                    LazyVStack(alignment: .leading, spacing: 15) {
+                    LazyVStack(alignment: .leading, spacing: 13) {
                         if runtime.messages.isEmpty {
                             VStack(spacing: 14) {
-                                Image(systemName: "sparkles.rectangle.stack")
-                                    .font(.system(size: 45))
-                                    .foregroundStyle(tint)
-                                Text("Your models. Your device.")
-                                    .font(.title3.weight(.semibold))
-                                Text(runtime.ready ? "Ask anything, or attach an image for a vision model." : "Import and load a model in the Models tab.")
-                                    .font(.subheadline)
+                                Image(systemName: "brain.head.profile")
+                                    .font(.system(size: 57, weight: .ultraLight))
+                                    .foregroundStyle(mint)
+                                Text("Think locally.")
+                                    .font(.system(size: 28, weight: .bold, design: .rounded))
+                                    .foregroundStyle(.white)
+                                Text(runtime.ready ? "Your private model is ready.\nStart a conversation." :
+                                     "Load a model from your library\nto begin a private conversation.")
+                                    .font(.system(size: 14))
                                     .multilineTextAlignment(.center)
-                                    .foregroundStyle(.secondary)
+                                    .foregroundStyle(.gray)
+                                    .lineSpacing(4)
+                                if !runtime.ready {
+                                    Button("Go to model library") { page = 1 }
+                                        .font(.system(size: 13, weight: .semibold))
+                                        .padding(.top, 6)
+                                }
                             }
                             .frame(maxWidth: .infinity)
-                            .padding(.top, 80)
+                            .padding(.top, 90)
                         }
                         ForEach(runtime.messages) { message in
                             HStack {
                                 if message.role == "user" { Spacer(minLength: 45) }
                                 Text(message.text.isEmpty ? "…" : message.text)
-                                    .font(.body)
+                                    .font(.system(size: 14))
+                                    .foregroundStyle(.white)
                                     .textSelection(.enabled)
-                                    .padding(14)
-                                    .background(message.role == "user" ? tint.opacity(0.16) : Color.white.opacity(0.07))
-                                    .clipShape(RoundedRectangle(cornerRadius: 14))
+                                    .padding(.horizontal, 15)
+                                    .padding(.vertical, 12)
+                                    .background(message.role == "user" ? azure.opacity(0.18) : panel,
+                                                in: RoundedRectangle(cornerRadius: 17))
                                 if message.role != "user" { Spacer(minLength: 45) }
                             }
                             .id(message.id)
                         }
                     }
-                    .padding(17)
+                    .padding(19)
                 }
                 .onChange(of: runtime.messages.count) { _, _ in
-                    if let last = runtime.messages.last {
-                        withAnimation { proxy.scrollTo(last.id, anchor: .bottom) }
+                    if let id = runtime.messages.last?.id {
+                        withAnimation { scroll.scrollTo(id, anchor: .bottom) }
                     }
                 }
             }
-
-            if let attachedImage {
+            if imageURL != nil {
                 HStack {
-                    Image(systemName: "photo")
-                    Text(attachedImage.lastPathComponent)
-                        .lineLimit(1)
-                        .font(.caption)
+                    Image(systemName: "photo.fill").foregroundStyle(mint)
+                    Text("Image attached").font(.caption).foregroundStyle(.white)
                     Spacer()
                     Button {
-                        self.attachedImage = nil
-                        pickerItem = nil
-                    } label: { Image(systemName: "xmark.circle.fill") }
+                        imageURL = nil
+                        imageItem = nil
+                    } label: {
+                        Image(systemName: "xmark.circle.fill").foregroundStyle(.gray)
+                    }
                 }
-                .padding(.horizontal, 17)
+                .padding(.horizontal, 20)
                 .padding(.vertical, 7)
             }
-
             HStack(alignment: .bottom, spacing: 12) {
-                PhotosPicker(selection: $pickerItem, matching: .images) {
+                PhotosPicker(selection: $imageItem, matching: .images) {
                     Image(systemName: "photo.badge.plus")
-                        .font(.title3)
-                        .frame(width: 30, height: 42)
+                        .font(.system(size: 20))
+                        .foregroundStyle(runtime.vision ? mint : .gray)
+                        .frame(width: 30, height: 43)
                 }
-                .disabled(!runtime.vision || runtime.generating)
-                TextField("Message your local model", text: $input, axis: .vertical)
-                    .lineLimit(1...5)
-                    .padding(10)
-                    .background(Color.white.opacity(0.08))
-                    .clipShape(RoundedRectangle(cornerRadius: 11))
+                .disabled(!runtime.vision || busy)
+                TextField("Ask your model…", text: $input, axis: .vertical)
+                    .font(.system(size: 14))
+                    .lineLimit(1...4)
+                    .padding(12)
+                    .background(panelRaised, in: RoundedRectangle(cornerRadius: 13))
                 if runtime.generating {
-                    Button {
-                        runtime.stop()
-                    } label: {
-                        Image(systemName: "stop.fill")
+                    Button { runtime.stop() } label: {
+                        Image(systemName: "stop.circle.fill")
+                            .font(.system(size: 30))
                             .foregroundStyle(.red)
-                            .frame(width: 38, height: 42)
                     }
                 } else {
                     Button {
-                        runtime.send(text: input, imagePath: attachedImage?.path)
+                        runtime.send(text: input, imagePath: imageURL?.path)
                         input = ""
-                        attachedImage = nil
-                        pickerItem = nil
+                        imageURL = nil
+                        imageItem = nil
                     } label: {
                         Image(systemName: "arrow.up.circle.fill")
                             .font(.system(size: 30))
-                            .frame(width: 38, height: 42)
+                            .foregroundStyle(mint)
                     }
-                    .disabled(!runtime.ready || (input.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && attachedImage == nil))
+                    .disabled(!runtime.ready || (input.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && imageURL == nil))
                 }
             }
-            .padding(.horizontal, 16)
-            .padding(.top, 10)
-            .padding(.bottom, 9)
+            .padding(.horizontal, 18)
+            .padding(.vertical, 11)
+            .background(background)
         }
+    }
+}
+
+private extension View {
+    func cardSurface() -> some View {
+        self.padding(17)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(Color(red: 0.075, green: 0.105, blue: 0.16),
+                        in: RoundedRectangle(cornerRadius: 22))
+            .overlay(RoundedRectangle(cornerRadius: 22)
+                .strokeBorder(Color.white.opacity(0.06), lineWidth: 1))
     }
 }
