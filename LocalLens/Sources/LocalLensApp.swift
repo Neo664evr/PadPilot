@@ -35,7 +35,11 @@ final class LocalRuntime: ObservableObject {
     @Published var ready = false
     @Published var vision = false
     @Published var lastStats = ""
-    @Published var memoryStatus = ""
+    @Published var memoryStatus = "Reading memory…"
+    @Published var installedRAM = "—"
+    @Published var currentAppRAM = "—"
+    @Published var remainingAppBudget = "—"
+    @Published var memoryLastChecked = "—"
 
     private let bridge = LlamaBridge()
     private let queue = DispatchQueue(label: "locallens.inference", qos: .userInitiated)
@@ -57,15 +61,39 @@ final class LocalRuntime: ObservableObject {
         refreshMemoryStatus()
     }
 
+    /// Show real, different measurements instead of calling a process limit "free RAM".
+    /// task_info's phys_footprint reflects the running app/container's physical footprint.
+    /// os_proc_available_memory is remaining *process* headroom, NOT free device RAM.
     func refreshMemoryStatus() {
+        installedRAM = ByteCountFormatter.string(
+            fromByteCount: Int64(ProcessInfo.processInfo.physicalMemory), countStyle: .memory)
+
+        var vm = task_vm_info_data_t()
+        let words = MemoryLayout<task_vm_info_data_t>.stride / MemoryLayout<integer_t>.stride
+        var count = mach_msg_type_number_t(words)
+        let outcome = withUnsafeMutablePointer(to: &vm) { ptr in
+            ptr.withMemoryRebound(to: integer_t.self, capacity: words) {
+                task_info(mach_task_self_, task_flavor_t(TASK_VM_INFO), $0, &count)
+            }
+        }
+        if outcome == KERN_SUCCESS {
+            currentAppRAM = ByteCountFormatter.string(
+                fromByteCount: Int64(clamping: vm.phys_footprint), countStyle: .memory)
+        } else {
+            currentAppRAM = "Unavailable"
+        }
+
         #if targetEnvironment(simulator)
-        memoryStatus = "Simulator memory"
+        remainingAppBudget = "Not applicable to Simulator"
         #else
-        let available = Int64(os_proc_available_memory())
-        memoryStatus = available > 0
-            ? "Available memory: \(ByteCountFormatter.string(fromByteCount: available, countStyle: .memory))"
-            : "Available memory: unknown"
+        let allowance = os_proc_available_memory()
+        remainingAppBudget = allowance > 0
+            ? "≈" + ByteCountFormatter.string(fromByteCount: Int64(clamping: allowance), countStyle: .memory)
+            : "Unavailable"
         #endif
+
+        memoryStatus = "RAM in use: \(currentAppRAM) · additional app allowance: \(remainingAppBudget)"
+        memoryLastChecked = Date().formatted(date: .omitted, time: .standard)
     }
 
     private func persist() {
@@ -475,6 +503,12 @@ struct LocalLensView: View {
             Text("This will remove the GGUF from LocalLens storage.")
         }
         .sheet(isPresented: $settingsOpen) { settingsSheet }
+        .task {
+            while !Task.isCancelled {
+                runtime.refreshMemoryStatus()
+                try? await Task.sleep(nanoseconds: 2_000_000_000)
+            }
+        }
         .onChange(of: runtime.generating) { wasGenerating, generating in
             if wasGenerating && !generating && readAloud,
                let answer = runtime.messages.last,
@@ -907,12 +941,25 @@ struct LocalLensView: View {
                         .font(.footnote)
                         .foregroundStyle(.secondary)
                 }
-                Section("Diagnostics") {
-                    Text(runtime.memoryStatus)
+                Section("Memory — live measurements") {
+                    LabeledContent("Device physical RAM", value: runtime.installedRAM)
+                    LabeledContent("LocalLens / container RAM in use", value: runtime.currentAppRAM)
+                    LabeledContent("More memory iOS permits this app", value: runtime.remainingAppBudget)
+                    Text("These are different numbers. The last one is not free iPhone RAM; it is an iOS process-allocation estimate. Metal and LiveContainer may affect the app footprint.")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                    HStack {
+                        Text("Updated \(runtime.memoryLastChecked)")
+                            .foregroundStyle(.secondary)
+                        Spacer()
+                        Button("Refresh") { runtime.refreshMemoryStatus() }
+                    }
+                    .font(.footnote)
+                }
+                Section("Generation diagnostics") {
                     Text(runtime.lastStats.isEmpty ? "No generation statistics yet." : runtime.lastStats)
                         .textSelection(.enabled)
-                    Button("Refresh memory reading") { runtime.refreshMemoryStatus() }
-                    Text("If iOS memory is too low, sending a photo is blocked instead of invoking the image encoder.")
+                    Text("The RAM limit cannot be increased by changing this display. Photo safety checks still use remaining process headroom.")
                         .font(.footnote)
                         .foregroundStyle(.secondary)
                 }
