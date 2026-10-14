@@ -4,9 +4,15 @@ import UniformTypeIdentifiers
 
 // LocalLens: a standalone on-device GGUF chat and vision client.
 struct LocalChat: Identifiable {
-    let id = UUID()
+    let id: UUID
     let role: String
     var text: String
+
+    init(role: String, text: String) {
+        self.id = UUID()
+        self.role = role
+        self.text = text
+    }
 }
 
 final class LocalRuntime: ObservableObject {
