@@ -424,6 +424,7 @@ struct LocalLensView: View {
     @State private var isImporting = false
     @State private var page = 0
     @State private var input = ""
+    @FocusState private var chatInputFocused: Bool
     @State private var imageItem: PhotosPickerItem?
     @State private var imageURL: URL?
     @StateObject private var speaker = SpeechPlayer()
@@ -503,6 +504,9 @@ struct LocalLensView: View {
             Text("This will remove the GGUF from LocalLens storage.")
         }
         .sheet(isPresented: $settingsOpen) { settingsSheet }
+        .onChange(of: page) { _, _ in
+            chatInputFocused = false
+        }
         .task {
             while !Task.isCancelled {
                 runtime.refreshMemoryStatus()
@@ -1041,6 +1045,11 @@ struct LocalLensView: View {
                     }
                     .padding(19)
                 }
+                .scrollDismissesKeyboard(.interactively)
+                .contentShape(Rectangle())
+                .onTapGesture {
+                    chatInputFocused = false
+                }
                 .onChange(of: runtime.messages.count) { _, _ in
                     if let id = runtime.messages.last?.id {
                         withAnimation { scroll.scrollTo(id, anchor: .bottom) }
@@ -1068,6 +1077,18 @@ struct LocalLensView: View {
                 .padding(.vertical, 7)
             }
             HStack(alignment: .bottom, spacing: 12) {
+                if chatInputFocused {
+                    Button {
+                        chatInputFocused = false
+                    } label: {
+                        Image(systemName: "keyboard.chevron.compact.down")
+                            .font(.system(size: 19))
+                            .foregroundStyle(mint)
+                            .frame(width: 30, height: 43)
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel("Hide keyboard")
+                }
                 PhotosPicker(selection: $imageItem, matching: .images) {
                     Image(systemName: "photo.badge.plus")
                         .font(.system(size: 20))
@@ -1076,6 +1097,8 @@ struct LocalLensView: View {
                 }
                 .disabled(!runtime.vision || busy)
                 TextField("Ask your model…", text: $input, axis: .vertical)
+                    .focused($chatInputFocused)
+                    .submitLabel(.send)
                     .font(.system(size: 14))
                     .lineLimit(1...4)
                     .padding(12)
@@ -1101,6 +1124,7 @@ struct LocalLensView: View {
                             minimumImageMemoryMB: minImageFreeMB
                         )
                         if applied {
+                            chatInputFocused = false
                             input = ""
                             imageURL = nil
                             imageItem = nil
