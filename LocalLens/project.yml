@@ -18,8 +18,8 @@ targets:
       path: Info.plist
       properties:
         CFBundleDisplayName: LocalLens
-        CFBundleShortVersionString: "3.1"
-        CFBundleVersion: "4"
+        CFBundleShortVersionString: "3.2"
+        CFBundleVersion: "5"
         UILaunchScreen:
           UIColorName: ""
         UIFileSharingEnabled: true
