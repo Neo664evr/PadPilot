@@ -569,6 +569,9 @@ struct LocalLensView: View {
     @State private var pendingDeletion: URL?
     @State private var showDeleteDialog = false
     @State private var imageNotice = ""
+    @State private var clearChatPrompt = false
+    @AppStorage("LL.v4.accent") private var accentChoice = "mint"
+    @AppStorage("LL.v4.compact") private var compactBubbles = false
 
     @AppStorage("LL.v3.context") private var contextLength = 4096
     @AppStorage("LL.v3.gpuLayers") private var gpuLayers = 999
@@ -587,7 +590,11 @@ struct LocalLensView: View {
     private let background = Color(red: 0.035, green: 0.055, blue: 0.09)
     private let panel = Color(red: 0.075, green: 0.105, blue: 0.16)
     private let panelRaised = Color(red: 0.105, green: 0.145, blue: 0.21)
-    private let mint = Color(red: 0.42, green: 0.94, blue: 0.78)
+    private var mint: Color {
+        accentChoice == "violet" ? Color(red: 0.79, green: 0.67, blue: 1.0) :
+        accentChoice == "blue" ? Color(red: 0.49, green: 0.74, blue: 1.0) :
+        Color(red: 0.42, green: 0.94, blue: 0.78)
+    }
     private let azure = Color(red: 0.48, green: 0.68, blue: 1.0)
 
     private var ggufType: UTType { UTType(filenameExtension: "gguf") ?? .data }
@@ -598,7 +605,15 @@ struct LocalLensView: View {
     var body: some View {
         VStack(spacing: 0) {
             header
-            if page == 0 { chatPanel } else { modelPanel }
+            if page == 0 {
+                chatPanel
+            } else if page == 1 {
+                modelPanel
+            } else {
+                ChatsLibraryView(runtime: runtime, accent: mint) {
+                    withAnimation(.easeInOut(duration: 0.16)) { page = 0 }
+                }
+            }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(background.ignoresSafeArea())
@@ -641,6 +656,13 @@ struct LocalLensView: View {
             Text("This will remove the GGUF from LocalLens storage.")
         }
         .sheet(isPresented: $settingsOpen) { settingsSheet }
+        .confirmationDialog("Clear this conversation?", isPresented: $clearChatPrompt,
+                            titleVisibility: .visible) {
+            Button("Clear messages", role: .destructive) { runtime.reset() }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("The messages in this chat will be deleted. Other chats are safe.")
+        }
         .onChange(of: page) { _, _ in
             chatInputFocused = false
         }
@@ -729,6 +751,19 @@ struct LocalLensView: View {
                         .foregroundStyle(.gray)
                 }
                 Spacer()
+                Button {
+                    runtime.newConversation()
+                    withAnimation { page = 0 }
+                    chatInputFocused = true
+                } label: {
+                    Image(systemName: "square.and.pencil")
+                        .font(.system(size: 17, weight: .semibold))
+                        .foregroundStyle(.white)
+                        .frame(width: 40, height: 40)
+                        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 12))
+                }
+                .disabled(busy)
+                .accessibilityLabel("New chat")
                 Button { settingsOpen = true } label: {
                     Image(systemName: "slider.horizontal.3")
                         .font(.system(size: 17))
@@ -741,7 +776,7 @@ struct LocalLensView: View {
                     Circle()
                         .fill(runtime.ready ? mint : Color.gray)
                         .frame(width: 7, height: 7)
-                    Text(runtime.ready ? "ONLINE" : "IDLE")
+                    Text(runtime.ready ? "LOADED" : "OFFLINE")
                         .font(.system(size: 10, weight: .bold, design: .monospaced))
                         .foregroundStyle(runtime.ready ? mint : .gray)
                 }
@@ -750,6 +785,7 @@ struct LocalLensView: View {
                 .background(panelRaised, in: Capsule())
             }
             HStack(spacing: 6) {
+                pageButton("Chats", icon: "clock.arrow.circlepath", index: 2)
                 pageButton("Chat", icon: "bubble.left.and.bubble.right", index: 0)
                 pageButton("Models", icon: "cpu", index: 1)
             }
@@ -1040,6 +1076,14 @@ struct LocalLensView: View {
                         .font(.footnote)
                         .foregroundStyle(.secondary)
                 }
+                Section("Appearance") {
+                    Picker("Accent color", selection: $accentChoice) {
+                        Text("Mint").tag("mint")
+                        Text("Ocean blue").tag("blue")
+                        Text("Violet").tag("violet")
+                    }
+                    Toggle("Compact message bubbles", isOn: $compactBubbles)
+                }
                 Section("Generation") {
                     Stepper("Maximum tokens: \(maxTokens)", value: $maxTokens, in: 64...4096, step: 64)
                     VStack(alignment: .leading) {
@@ -1063,7 +1107,7 @@ struct LocalLensView: View {
                     TextField("Stop sequences (one per line)", text: $stopWords, axis: .vertical)
                         .lineLimit(2...5)
                     Toggle("Read finished answers aloud", isOn: $readAloud)
-                    Button("Clear current chat", role: .destructive) { runtime.reset() }
+                    Button("Clear current chat", role: .destructive) { clearChatPrompt = true }
                         .disabled(busy)
                     Text("Chats are stored locally and restored after reopening.")
                         .font(.footnote)
@@ -1118,168 +1162,333 @@ struct LocalLensView: View {
 
     private var chatPanel: some View {
         VStack(spacing: 0) {
-            HStack(spacing: 8) {
-                Circle().fill(runtime.ready ? mint : Color.gray).frame(width: 7, height: 7)
-                Text(runtime.status)
-                    .font(.system(size: 12, weight: .medium))
-                    .lineLimit(2)
-                    .foregroundStyle(.gray)
-                Spacer()
-                if runtime.ready {
-                    Button {
-                        runtime.reset()
-                    } label: {
-                        Image(systemName: "arrow.counterclockwise")
-                            .foregroundStyle(mint)
+            HStack(spacing: 10) {
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(runtime.activeConversation?.title ?? "New conversation")
+                        .font(.system(size: 17, weight: .bold, design: .rounded))
+                        .foregroundStyle(.white)
+                        .lineLimit(1)
+                    HStack(spacing: 6) {
+                        Circle()
+                            .fill(runtime.ready ? mint : Color.orange)
+                            .frame(width: 6, height: 6)
+                        Text(runtime.ready ?
+                             (runtime.vision ? "Vision model ready" : "Local text model ready") :
+                             "Select a model to begin")
+                            .font(.system(size: 11))
+                            .foregroundStyle(.secondary)
                     }
-                    .disabled(busy)
                 }
+                Spacer(minLength: 6)
+                if runtime.generating {
+                    ProgressView().tint(mint)
+                }
+                Button {
+                    withAnimation { page = 2 }
+                } label: {
+                    Image(systemName: "sidebar.left")
+                        .font(.system(size: 17))
+                        .frame(width: 37, height: 39)
+                        .foregroundStyle(.white)
+                        .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 12))
+                }
+                .accessibilityLabel("All chats")
+                Menu {
+                    Button {
+                        runtime.newConversation()
+                    } label: {
+                        Label("New chat", systemImage: "square.and.pencil")
+                    }
+                    Button {
+                        clearChatPrompt = true
+                    } label: {
+                        Label("Clear this chat", systemImage: "trash")
+                    }
+                    .disabled(busy || runtime.messages.isEmpty)
+                    if let chat = runtime.activeConversation {
+                        Button {
+                            runtime.togglePin(chat.id)
+                        } label: {
+                            Label(chat.pinned ? "Unpin chat" : "Pin chat",
+                                  systemImage: chat.pinned ? "pin.slash" : "pin")
+                        }
+                        ShareLink(item: chat.exportedText) {
+                            Label("Share transcript", systemImage: "square.and.arrow.up")
+                        }
+                    }
+                } label: {
+                    Image(systemName: "ellipsis")
+                        .font(.system(size: 18, weight: .semibold))
+                        .foregroundStyle(.white)
+                        .frame(width: 36, height: 39)
+                        .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 12))
+                }
+                .accessibilityLabel("Chat options")
             }
             .padding(.horizontal, 19)
-            .padding(.vertical, 10)
-            Divider().overlay(Color.white.opacity(0.04))
+            .padding(.vertical, 13)
+
+            Rectangle().fill(Color.white.opacity(0.07)).frame(height: 1)
+
             ScrollViewReader { scroll in
                 ScrollView {
-                    LazyVStack(alignment: .leading, spacing: 13) {
+                    LazyVStack(alignment: .leading, spacing: compactBubbles ? 9 : 16) {
                         if runtime.messages.isEmpty {
-                            VStack(spacing: 14) {
-                                Image(systemName: "brain.head.profile")
-                                    .font(.system(size: 57, weight: .ultraLight))
-                                    .foregroundStyle(mint)
-                                Text("Think locally.")
-                                    .font(.system(size: 28, weight: .bold, design: .rounded))
-                                    .foregroundStyle(.white)
-                                Text(runtime.ready ? "Your private model is ready.\nStart a conversation." :
-                                     "Load a model from your library\nto begin a private conversation.")
-                                    .font(.system(size: 14))
-                                    .multilineTextAlignment(.center)
-                                    .foregroundStyle(.gray)
-                                    .lineSpacing(4)
-                                if !runtime.ready {
-                                    Button("Go to model library") { page = 1 }
-                                        .font(.system(size: 13, weight: .semibold))
-                                        .padding(.top, 6)
-                                }
-                            }
-                            .frame(maxWidth: .infinity)
-                            .padding(.top, 90)
+                            emptyChat
                         }
                         ForEach(runtime.messages) { message in
-                            HStack {
-                                if message.role == "user" { Spacer(minLength: 45) }
-                                Text(message.text.isEmpty ? "…" : message.text)
-                                    .font(.system(size: 14))
-                                    .foregroundStyle(.white)
-                                    .textSelection(.enabled)
-                                    .padding(.horizontal, 15)
-                                    .padding(.vertical, 12)
-                                    .background(message.role == "user" ? azure.opacity(0.18) : panel,
-                                                in: RoundedRectangle(cornerRadius: 17))
-                                if message.role != "user" { Spacer(minLength: 45) }
+                            messageCard(message)
+                                .id(message.id)
+                        }
+                        if runtime.generating {
+                            HStack(spacing: 7) {
+                                ProgressView().tint(mint)
+                                Text(runtime.vision ? "Analyzing…" : "Generating…")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
                             }
-                            .id(message.id)
+                            .padding(.leading, 42)
+                            .padding(.top, 8)
                         }
                     }
-                    .padding(19)
+                    .padding(.horizontal, 16)
+                    .padding(.vertical, 20)
                 }
                 .scrollDismissesKeyboard(.interactively)
                 .contentShape(Rectangle())
-                .onTapGesture {
-                    chatInputFocused = false
-                }
+                .onTapGesture { chatInputFocused = false }
                 .onChange(of: runtime.messages.count) { _, _ in
                     if let id = runtime.messages.last?.id {
-                        withAnimation { scroll.scrollTo(id, anchor: .bottom) }
+                        withAnimation(.easeOut(duration: 0.2)) {
+                            scroll.scrollTo(id, anchor: .bottom)
+                        }
                     }
                 }
             }
+
             if !imageNotice.isEmpty {
-                Text(imageNotice).font(.caption).foregroundStyle(.orange)
-                    .padding(.horizontal, 19)
-                    .padding(.vertical, 5)
+                Text(imageNotice)
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+                    .padding(.horizontal, 18)
             }
-            if imageURL != nil {
-                HStack {
-                    Image(systemName: "photo.fill").foregroundStyle(mint)
-                    Text("Image attached").font(.caption).foregroundStyle(.white)
+            if let url = imageURL {
+                HStack(spacing: 10) {
+                    if let preview = UIImage(contentsOfFile: url.path) {
+                        Image(uiImage: preview)
+                            .resizable().scaledToFill()
+                            .frame(width: 41, height: 41)
+                            .clipShape(RoundedRectangle(cornerRadius: 9))
+                    }
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Image attached").font(.system(size: 12, weight: .semibold))
+                        Text("Will be processed locally").font(.system(size: 10)).foregroundStyle(.secondary)
+                    }
                     Spacer()
                     Button {
                         imageURL = nil
                         imageItem = nil
                     } label: {
-                        Image(systemName: "xmark.circle.fill").foregroundStyle(.gray)
+                        Image(systemName: "xmark.circle.fill")
+                            .font(.system(size: 21))
+                            .foregroundStyle(.secondary)
                     }
                 }
-                .padding(.horizontal, 20)
-                .padding(.vertical, 7)
+                .padding(9)
+                .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 13))
+                .padding(.horizontal, 16)
+                .padding(.bottom, 8)
             }
-            HStack(alignment: .bottom, spacing: 12) {
+
+            HStack(alignment: .bottom, spacing: 9) {
                 if chatInputFocused {
-                    Button {
-                        chatInputFocused = false
-                    } label: {
+                    Button { chatInputFocused = false } label: {
                         Image(systemName: "keyboard.chevron.compact.down")
-                            .font(.system(size: 19))
+                            .font(.system(size: 17))
                             .foregroundStyle(mint)
-                            .frame(width: 30, height: 43)
+                            .frame(width: 29, height: 44)
                     }
-                    .buttonStyle(.plain)
                     .accessibilityLabel("Hide keyboard")
                 }
                 PhotosPicker(selection: $imageItem, matching: .images) {
-                    Image(systemName: "photo.badge.plus")
-                        .font(.system(size: 20))
+                    Image(systemName: "plus")
+                        .font(.system(size: 19, weight: .medium))
                         .foregroundStyle(runtime.vision ? mint : .gray)
-                        .frame(width: 30, height: 43)
+                        .frame(width: 35, height: 44)
                 }
                 .disabled(!runtime.vision || busy)
-                TextField("Ask your model…", text: $input, axis: .vertical)
+                .accessibilityLabel("Attach image")
+
+                TextField("Message LocalLens", text: $input, axis: .vertical)
                     .focused($chatInputFocused)
+                    .font(.system(size: 15))
+                    .lineLimit(1...5)
+                    .padding(.horizontal, 14)
+                    .padding(.vertical, 11)
+                    .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 19))
                     .submitLabel(.send)
-                    .font(.system(size: 14))
-                    .lineLimit(1...4)
-                    .padding(12)
-                    .background(panelRaised, in: RoundedRectangle(cornerRadius: 13))
                 if runtime.generating {
                     Button { runtime.stop() } label: {
                         Image(systemName: "stop.circle.fill")
-                            .font(.system(size: 30))
+                            .font(.system(size: 32))
                             .foregroundStyle(.red)
+                            .frame(width: 37, height: 45)
                     }
                 } else {
-                    Button {
-                        let applied = runtime.send(
-                            text: input,
-                            imagePath: imageURL?.path,
-                            options: RunSettings(
-                                maxTokens: maxTokens, temperature: Float(temperature),
-                                topP: Float(topP), topK: topK,
-                                reasoningBudget: reasoningBudget,
-                                stopWords: stopWords.components(separatedBy: .newlines)
-                                    .filter { !$0.isEmpty }),
-                            systemPrompt: systemPrompt,
-                            minimumImageMemoryMB: minImageFreeMB
-                        )
-                        if applied {
-                            chatInputFocused = false
-                            input = ""
-                            imageURL = nil
-                            imageItem = nil
-                            imageNotice = ""
-                        }
-                    } label: {
+                    Button { sendMessage() } label: {
                         Image(systemName: "arrow.up.circle.fill")
-                            .font(.system(size: 30))
+                            .font(.system(size: 32))
                             .foregroundStyle(mint)
+                            .frame(width: 37, height: 45)
                     }
                     .disabled(!runtime.ready || (input.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && imageURL == nil))
                 }
             }
-            .padding(.horizontal, 18)
-            .padding(.vertical, 11)
-            .background(background)
+            .padding(.horizontal, 13)
+            .padding(.vertical, 12)
+            .background(.ultraThinMaterial)
         }
     }
+
+    private var emptyChat: some View {
+        VStack(spacing: 15) {
+            ZStack {
+                Circle().fill(mint.opacity(0.10)).frame(width: 102, height: 102)
+                Circle().strokeBorder(mint.opacity(0.28), lineWidth: 1)
+                    .frame(width: 86, height: 86)
+                Image(systemName: "sparkles")
+                    .font(.system(size: 35, weight: .light))
+                    .foregroundStyle(mint)
+            }
+            Text("Your space to think.")
+                .font(.system(size: 26, weight: .bold, design: .rounded))
+            Text(runtime.ready ?
+                 "Ask a question, build an idea, or attach a photo." :
+                 "Everything stays on your iPhone.\nChoose a model before your first message.")
+                .font(.system(size: 13))
+                .foregroundStyle(.secondary)
+                .multilineTextAlignment(.center)
+                .lineSpacing(4)
+            if !runtime.ready {
+                Button {
+                    withAnimation { page = 1 }
+                } label: {
+                    Label("Choose a model", systemImage: "cpu")
+                        .font(.system(size: 14, weight: .semibold))
+                        .foregroundStyle(.black)
+                        .padding(.horizontal, 24).padding(.vertical, 12)
+                        .background(mint, in: Capsule())
+                }
+            } else {
+                VStack(spacing: 9) {
+                    suggestion("Explain something simply", icon: "lightbulb")
+                    suggestion("Help me write some code", icon: "chevron.left.forwardslash.chevron.right")
+                    suggestion("Brainstorm a creative idea", icon: "wand.and.stars")
+                }
+                .padding(.top, 5)
+            }
+        }
+        .frame(maxWidth: .infinity)
+        .padding(.top, 60)
+        .padding(.bottom, 40)
+    }
+
+    private func suggestion(_ title: String, icon: String) -> some View {
+        Button {
+            input = title
+            chatInputFocused = true
+        } label: {
+            HStack {
+                Image(systemName: icon)
+                    .foregroundStyle(mint)
+                Text(title)
+                    .foregroundStyle(.white)
+                Spacer()
+                Image(systemName: "arrow.up.left")
+                    .foregroundStyle(.secondary)
+            }
+            .font(.system(size: 12, weight: .medium))
+            .padding(14)
+            .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 14))
+        }
+        .buttonStyle(.plain)
+    }
+
+    private func messageCard(_ message: LocalChat) -> some View {
+        let fromUser = message.role == "user"
+        return HStack(alignment: .top, spacing: 9) {
+            if fromUser { Spacer(minLength: 40) }
+            if !fromUser {
+                Image(systemName: "sparkles")
+                    .font(.system(size: 12, weight: .bold))
+                    .foregroundStyle(mint)
+                    .frame(width: 28, height: 28)
+                    .background(mint.opacity(0.12), in: Circle())
+            }
+            VStack(alignment: .leading, spacing: 7) {
+                Text(fromUser ? "YOU" : "LOCALLENS")
+                    .font(.system(size: 9, weight: .bold, design: .monospaced))
+                    .tracking(1)
+                    .foregroundStyle(fromUser ? azure : mint)
+                Text(.init(message.text.isEmpty ? "…" : message.text))
+                    .font(.system(size: 14))
+                    .foregroundStyle(.white)
+                    .textSelection(.enabled)
+                    .lineSpacing(4)
+            }
+            .padding(compactBubbles ? 11 : 14)
+            .background(fromUser ? azure.opacity(0.12) : Color.white.opacity(0.055),
+                        in: RoundedRectangle(cornerRadius: 17))
+            .overlay {
+                RoundedRectangle(cornerRadius: 17)
+                    .strokeBorder(Color.white.opacity(0.07), lineWidth: 1)
+            }
+            .contextMenu {
+                Button {
+                    UIPasteboard.general.string = message.text
+                } label: {
+                    Label("Copy message", systemImage: "doc.on.doc")
+                }
+                if !fromUser {
+                    Button {
+                        speaker.speak(message.text)
+                    } label: {
+                        Label("Read aloud", systemImage: "speaker.wave.2")
+                    }
+                }
+                ShareLink(item: message.text) {
+                    Label("Share message", systemImage: "square.and.arrow.up")
+                }
+            }
+            if !fromUser { Spacer(minLength: 12) }
+        }
+    }
+
+    private func sendMessage() {
+        let applied = runtime.send(
+            text: input,
+            imagePath: imageURL?.path,
+            options: RunSettings(
+                maxTokens: maxTokens,
+                temperature: Float(temperature),
+                topP: Float(topP),
+                topK: topK,
+                reasoningBudget: reasoningBudget,
+                stopWords: stopWords.components(separatedBy: .newlines)
+                    .filter { !$0.isEmpty }
+            ),
+            systemPrompt: systemPrompt,
+            minimumImageMemoryMB: minImageFreeMB
+        )
+        if applied {
+            chatInputFocused = false
+            input = ""
+            imageURL = nil
+            imageItem = nil
+            imageNotice = ""
+        }
+    }
+
 }
 
 private extension View {
