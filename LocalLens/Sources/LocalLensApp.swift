@@ -41,6 +41,7 @@ final class LocalRuntime: ObservableObject {
     private let queue = DispatchQueue(label: "locallens.inference", qos: .userInitiated)
     private var firstTurn = true
     private var gemmaDialect = false
+    private var loadedSystemPrompt = ""
     private(set) var loadedModelPath: String?
     private(set) var loadedProjectorPath: String?
     private static let conversationKey = "locallens.v3.messages"
@@ -116,6 +117,7 @@ final class LocalRuntime: ObservableObject {
                     self.ready = true
                     self.vision = hasVision
                     self.gemmaDialect = gemma
+                    self.loadedSystemPrompt = systemPrompt
                     self.loadedModelPath = modelPath
                     self.loadedProjectorPath = projectorPath
                     self.firstTurn = true
@@ -157,9 +159,11 @@ final class LocalRuntime: ObservableObject {
         persist()
         firstTurn = true
         guard ready else { return }
+        let sys = gemmaDialect || loadedSystemPrompt.isEmpty
+            ? "" : "<|im_start|>system\n\(loadedSystemPrompt)<|im_end|>\n"
         queue.async {
             do {
-                try self.bridge.reset(withSystemPrompt: "")
+                try self.bridge.reset(withSystemPrompt: sys)
             } catch {
                 DispatchQueue.main.async { self.status = error.localizedDescription }
             }
@@ -236,28 +240,31 @@ final class LocalRuntime: ObservableObject {
             params.topK = Int32(max(0, min(200, options.topK)))
             params.thinkBudget = Int32(max(0, options.reasoningBudget))
             var stopReached = false
+            var accumulated = ""
             let started = Date()
             self.bridge.generate(withPrompt: prompt,
                                  imagePaths: imagePaths,
                                  audioPaths: [],
                                  params: params,
                                  onToken: { piece in
+                // Keep token assembly and stop detection on the inference queue.
+                // Never mutate callback state from the UI queue.
                 guard !stopReached else { return }
+                accumulated += piece
+                if let stop = options.stopWords.filter({ !$0.isEmpty })
+                    .compactMap({ marker -> (Int, String)? in
+                        guard let range = accumulated.range(of: marker) else { return nil }
+                        return (accumulated.distance(from: accumulated.startIndex, to: range.lowerBound), marker)
+                    }).min(by: { $0.0 < $1.0 }) {
+                    accumulated = String(accumulated.prefix(stop.0))
+                    stopReached = true
+                    self.bridge.requestStop()
+                }
+                let output = accumulated
                 DispatchQueue.main.async {
-                    guard let index = self.messages.firstIndex(where: { $0.id == answerID }) else { return }
-                    var candidate = self.messages[index].text + piece
-                    if let stop = options.stopWords.filter({ !$0.isEmpty })
-                        .compactMap({ marker -> (Int, String)? in
-                            if let range = candidate.range(of: marker) {
-                                return (candidate.distance(from: candidate.startIndex, to: range.lowerBound), marker)
-                            }
-                            return nil
-                        }).min(by: { $0.0 < $1.0 }) {
-                        candidate = String(candidate.prefix(stop.0))
-                        stopReached = true
-                        self.bridge.requestStop()
+                    if let index = self.messages.firstIndex(where: { $0.id == answerID }) {
+                        self.messages[index].text = output
                     }
-                    self.messages[index].text = candidate
                 }
             }, onDone: { success, message, stats in
                 let elapsed = Date().timeIntervalSince(started)
